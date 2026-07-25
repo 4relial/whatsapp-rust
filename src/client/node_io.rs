@@ -36,6 +36,28 @@ impl ReadLoopError {
     }
 }
 
+/// Borrows instead of taking `ValueRef::to_jid`'s owned `Jid`: this runs once
+/// per inbound stanza.
+#[inline]
+fn from_jid_matches(
+    node: &wacore_binary::NodeRef<'_>,
+    pred: impl Fn(&wacore_binary::jid::JidRef<'_>) -> bool,
+) -> bool {
+    match node.get_attr("from") {
+        Some(wacore_binary::node::ValueRef::Jid(jid)) => pred(jid),
+        Some(wacore_binary::node::ValueRef::String(s)) => {
+            wacore_binary::jid::parse_jid_ref(s.as_ref()).is_some_and(|jid| pred(&jid))
+        }
+        None => false,
+    }
+}
+
+/// The wire shape the server uses for E2EE status updates, carrying the same
+/// payload as `<message from="status@broadcast">`.
+fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
+    from_jid_matches(node, |jid| jid.is_status_broadcast())
+}
+
 impl Client {
     /// Read the current semaphore generation and Arc atomically under the mutex.
     pub(crate) fn read_message_semaphore(&self) -> (u64, Arc<async_lock::Semaphore>) {
@@ -178,35 +200,7 @@ impl Client {
                                 while let Some(encrypted_frame) = frame_decoder.decode_frame() {
                                     // Decrypt the frame synchronously (required for noise counter ordering)
                                     if let Some(node) = self.decrypt_frame(&noise_socket, encrypted_frame) {
-                                        // Determine processing mode for this node:
-                                        // - Critical nodes (success/failure/stream:error): inline, required for state
-                                        // - Message nodes: inline, preserves arrival order for per-chat queues
-                                        //   (MessageHandler just enqueues + ACKs, heavy crypto runs in workers)
-                                        // - Acks/receipts: inline when unobserved; retry work detaches itself
-                                        // - ib (in-band): inline, ensures offline sync tracking (expected count)
-                                        //   is set up before offline messages are processed
-                                        // - Everything else: spawned concurrently for parallelism
-                                        let process_inline = match node.tag() {
-                                            "success" | "failure" | "stream:error" | "message" | "ib" => true,
-                                            // Preserve concurrent callback behavior when an app
-                                            // observes these events or every raw node.
-                                            "receipt" => {
-                                                !self.synchronous_ack
-                                                    && !self.raw_node_forwarding_enabled()
-                                                    && !self.core.event_bus.has_handler_for(
-                                                        wacore::types::events::EventKind::Receipt,
-                                                    )
-                                            }
-                                            "ack" => {
-                                                !self.raw_node_forwarding_enabled()
-                                                    && !self.core.event_bus.has_handler_for(
-                                                        wacore::types::events::EventKind::ServerAck,
-                                                    )
-                                            }
-                                            _ => false,
-                                        };
-
-                                        if process_inline {
+                                        if self.processes_inline(node.get()) {
                                             self.process_decrypted_node(node).await;
                                         } else {
                                             let client = self.clone();
@@ -517,6 +511,16 @@ impl Client {
                 )
                 .await;
             }
+            // Differs from a `<message>` only in tag, so WA Web retags it and
+            // runs the same pipeline.
+            "status" if is_status_broadcast_stanza(nr) => {
+                crate::handlers::message::MessageHandler::handle_inline(
+                    self.clone(),
+                    node,
+                    &mut cancelled,
+                )
+                .await;
+            }
             _ => {
                 let handled = self
                     .stanza_router
@@ -527,6 +531,8 @@ impl Client {
                         "Received unknown top-level node: {}",
                         DisplayableNodeRef(node.get())
                     );
+                    // The nack is this stanza's acknowledgement.
+                    cancelled |= self.nack_unrecognized_stanza(node.get());
                 }
             }
         }
@@ -534,6 +540,50 @@ impl Client {
         if !cancelled && let Some(node) = deferred_ack_node {
             self.maybe_deferred_ack(node).await;
         }
+    }
+
+    /// Whether a decrypted node must stay on the read loop instead of moving to
+    /// a spawned task. success/failure/stream:error carry connection state the
+    /// rest depends on, and `ib` sets up offline-sync tracking before the batch
+    /// arrives. message and status@broadcast only enqueue here, and a spawned
+    /// enqueue could put a group message ahead of the pkmsg that establishes its
+    /// session. Acks and receipts qualify only while nothing observes them.
+    pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+        match node.tag.as_ref() {
+            "success" | "failure" | "stream:error" | "message" | "ib" => true,
+            "status" => is_status_broadcast_stanza(node),
+            "receipt" => {
+                !self.synchronous_ack
+                    && !self.raw_node_forwarding_enabled()
+                    && !self
+                        .core
+                        .event_bus
+                        .has_handler_for(wacore::types::events::EventKind::Receipt)
+            }
+            "ack" => {
+                !self.raw_node_forwarding_enabled()
+                    && !self
+                        .core
+                        .event_bus
+                        .has_handler_for(wacore::types::events::EventKind::ServerAck)
+            }
+            _ => false,
+        }
+    }
+
+    /// Answering nothing leaves the stanza in the offline queue forever, which
+    /// is how an unhandled `<status>` kept recycling the stream. Returns whether
+    /// a nack was queued; one without `id`/`from` would have nothing to address.
+    fn nack_unrecognized_stanza(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
+        if node.get_attr("id").is_none() || node.get_attr("from").is_none() {
+            return false;
+        }
+        self.spawn_stanza_nack(
+            node,
+            wacore::protocol::nack::NackReason::UnrecognizedStanza,
+            None,
+        );
+        true
     }
 
     /// Per WA Web (`Handle/MsgSendReceipt.js`), only newsletter `<message>`
@@ -553,14 +603,13 @@ impl Client {
         if node.get_attr("id").is_none() {
             return false;
         }
-        let Some(from) = node.get_attr("from") else {
+        if node.get_attr("from").is_none() {
             return false;
-        };
+        }
         match tag {
             "receipt" | "notification" | "call" => true,
-            "message" => from
-                .to_jid()
-                .is_some_and(|j| j.is_newsletter() || j.is_status_broadcast()),
+            "message" => from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast()),
+            "status" => is_status_broadcast_stanza(node),
             _ => false,
         }
     }
@@ -1466,7 +1515,9 @@ impl Client {
                             .map(|v| v.as_str().to_string())
                             .unwrap_or_default();
                         warn!(
-                            "Stream error carrying <ack> (class={class:?}, id={id}): server-driven stream rotation, not an ack rejection; reconnect follows on stream end"
+                            "Stream error carrying <ack> (class={class:?}, id={id}): the server is \
+                             still owed a transport ack for that stanza and recycles the stream \
+                             until it arrives; reconnect follows on stream end"
                         );
                     } else {
                         warn!("Unknown stream error: {}", DisplayableNodeRef(node));

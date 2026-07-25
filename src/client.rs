@@ -1334,7 +1334,8 @@ fn encode_ack_bytes(
         None
     };
 
-    let own_device_pn = if tag == "message" {
+    // WA Web stamps the own device JID for both classes.
+    let own_device_pn = if tag == "message" || tag == "status" {
         Some(own_device_pn.ok_or(crate::features::StanzaResponseError::MissingLocalIdentity)?)
     } else {
         None

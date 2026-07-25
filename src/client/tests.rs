@@ -105,6 +105,19 @@ async fn test_ack_behavior_for_incoming_stanzas() {
         "should_ack must return TRUE for status@broadcast <message> (fallback for drop paths)."
     );
 
+    // A status update delivered as a top-level <status> stanza is owed the same
+    // transport ack; the server recycles the stream until it arrives.
+    let mut status_stanza_attrs = Attrs::new();
+    status_stanza_attrs.insert("from".to_string(), "status@broadcast".to_string());
+    status_stanza_attrs.insert("id".to_string(), "STATUS-STANZA-1".to_string());
+    status_stanza_attrs.insert("participant".to_string(), "200725430796339@lid".to_string());
+    status_stanza_attrs.insert("type".to_string(), "media".to_string());
+    let status_stanza = Node::new("status", status_stanza_attrs, None);
+    assert!(
+        client.should_ack(&status_stanza.as_node_ref()),
+        "should_ack must return TRUE for a top-level <status> stanza."
+    );
+
     info!(
         "✅ test_ack_behavior_for_incoming_stanzas passed: Client correctly differentiates which stanzas to acknowledge."
     );
@@ -3836,4 +3849,139 @@ async fn instrumented_runtime_reports_to_cpu_meter() {
         after_blocking.polls > after_spawn.polls,
         "blocking work is metered too"
     );
+}
+
+/// A status@broadcast stanza feeds the same per-chat queue a `<message>` does,
+/// so its enqueue must keep the read loop's arrival order.
+#[tokio::test]
+async fn status_broadcast_stanzas_are_dispatched_inline() {
+    use wacore_binary::builder::NodeBuilder;
+
+    let client = create_offline_sync_test_client().await;
+
+    let status = NodeBuilder::new("status")
+        .attr("from", "status@broadcast")
+        .attr("id", "INLINE-1")
+        .build();
+    assert!(
+        client.processes_inline(&status.as_node_ref()),
+        "a status@broadcast stanza must keep the read loop's arrival order"
+    );
+
+    let message = NodeBuilder::new("message")
+        .attr("from", "status@broadcast")
+        .attr("id", "INLINE-2")
+        .build();
+    assert!(
+        client.processes_inline(&message.as_node_ref()),
+        "the pre-existing <message> form is unchanged"
+    );
+
+    let newsletter_status = NodeBuilder::new("status")
+        .attr("from", "120363298765432100@newsletter")
+        .attr("id", "INLINE-3")
+        .build();
+    assert!(
+        !client.processes_inline(&newsletter_status.as_node_ref()),
+        "a newsletter <status> has no per-chat queue to order"
+    );
+}
+
+/// The server counts status updates and calls separately, so a preview that
+/// only reports messages/notifications/receipts leaves part of the backlog
+/// unaccounted for.
+#[tokio::test]
+async fn offline_preview_reports_status_and_call_counts() {
+    use wacore::types::events::{Event, EventHandler};
+
+    #[derive(Default)]
+    struct PreviewRecorder {
+        previews: std::sync::Mutex<Vec<wacore::types::events::OfflineSyncPreview>>,
+    }
+
+    impl EventHandler for PreviewRecorder {
+        fn handle_event(&self, event: Arc<Event>) {
+            if let Event::OfflineSyncPreview(preview) = &*event {
+                self.previews.lock().unwrap().push(preview.clone());
+            }
+        }
+    }
+
+    let client = create_offline_sync_test_client().await;
+    let recorder = Arc::new(PreviewRecorder::default());
+    client
+        .core
+        .event_bus
+        .subscribe_handler(recorder.clone())
+        .detach();
+
+    let node = NodeBuilder::new("ib")
+        .children([NodeBuilder::new("offline_preview")
+            .attr("count", "9")
+            .attr("message", "2")
+            .attr("notification", "1")
+            .attr("receipt", "1")
+            .attr("appdata", "1")
+            .attr("call", "1")
+            .attr("status", "3")
+            .build()])
+        .build();
+
+    client.process_node(node_to_owned_ref(node)).await;
+
+    let previews = recorder.previews.lock().unwrap();
+    let preview = previews
+        .first()
+        .expect("a preview event must be dispatched");
+    assert_eq!(preview.total, 9);
+    assert_eq!(preview.messages, 2);
+    assert_eq!(preview.notifications, 1);
+    assert_eq!(preview.receipts, 1);
+    assert_eq!(preview.app_data_changes, 1);
+    assert_eq!(preview.calls, 1);
+    assert_eq!(preview.statuses, 3);
+}
+
+/// A preview from a server that never sends the newer counts still parses.
+#[tokio::test]
+async fn offline_preview_defaults_absent_counts_to_zero() {
+    use wacore::types::events::{Event, EventHandler};
+
+    #[derive(Default)]
+    struct PreviewRecorder {
+        previews: std::sync::Mutex<Vec<wacore::types::events::OfflineSyncPreview>>,
+    }
+
+    impl EventHandler for PreviewRecorder {
+        fn handle_event(&self, event: Arc<Event>) {
+            if let Event::OfflineSyncPreview(preview) = &*event {
+                self.previews.lock().unwrap().push(preview.clone());
+            }
+        }
+    }
+
+    let client = create_offline_sync_test_client().await;
+    let recorder = Arc::new(PreviewRecorder::default());
+    client
+        .core
+        .event_bus
+        .subscribe_handler(recorder.clone())
+        .detach();
+
+    let node = NodeBuilder::new("ib")
+        .children([NodeBuilder::new("offline_preview")
+            .attr("count", "1")
+            .attr("message", "1")
+            .build()])
+        .build();
+
+    client.process_node(node_to_owned_ref(node)).await;
+
+    let previews = recorder.previews.lock().unwrap();
+    let preview = previews
+        .first()
+        .expect("a preview event must be dispatched");
+    assert_eq!(preview.total, 1);
+    assert_eq!(preview.calls, 0);
+    assert_eq!(preview.statuses, 0);
 }

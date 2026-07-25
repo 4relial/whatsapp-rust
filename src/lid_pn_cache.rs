@@ -30,6 +30,17 @@ pub use wacore::types::{LearningSource, LidPnEntry};
 const NS_LID: &str = "lid_pn_by_lid";
 const NS_PN: &str = "lid_pn_by_pn";
 
+/// An integer key allocates nothing and stays `Display` for the store path.
+#[inline]
+fn pack_contact_hash(hash: [u8; 3]) -> u32 {
+    u32::from_be_bytes([0, hash[0], hash[1], hash[2]])
+}
+
+#[inline]
+fn contact_hash_key(user: &str) -> u32 {
+    pack_contact_hash(wacore::crypto::contact_notification_hash(user))
+}
+
 /// Cache for LID to Phone Number mappings.
 ///
 /// This cache maintains bidirectional mappings between LIDs and phone numbers,
@@ -56,6 +67,13 @@ pub struct LidPnCache {
     /// record both identifiers. Recording lives here, at the write
     /// chokepoint, so callers cannot forget it.
     topology: std::sync::OnceLock<Arc<crate::client::device_topology::DeviceTopology>>,
+    /// Contact hash -> LID, for the `<devices>` `<update hash>` notification
+    /// whose 3-byte hash is the only identifier it carries. Both sides of a pair
+    /// are indexed because the hashed id is LID-namespaced only for migrated
+    /// contacts, and both resolve to the LID. Always in-process: derived state
+    /// each process rebuilds from its own warm-up. A 3-byte hash collides for
+    /// ~1 pair in a few thousand contacts, where the newest write wins.
+    contact_hash_to_lid: TypedCache<u32, Arc<str>>,
     /// PN -> the LID this process durably persisted for it. Lets the learn hot
     /// path skip a re-persist without swallowing the first live persist of a
     /// mapping an offline replay only warmed in memory. Keyed by the pair so a
@@ -101,6 +119,7 @@ impl LidPnCache {
                 // Always in-memory: tracks per-process persist state, never the
                 // mapping itself, so it must not go through the shared store.
                 persisted: TypedCache::from_local(config.build_with_tti()),
+                contact_hash_to_lid: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
             },
             None => Self {
@@ -108,6 +127,7 @@ impl LidPnCache {
                 pn_to_entry: TypedCache::from_local(config.build_with_tti()),
                 mutation: async_lock::Mutex::new(()),
                 persisted: TypedCache::from_local(config.build_with_tti()),
+                contact_hash_to_lid: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
             },
         }
@@ -249,15 +269,33 @@ impl LidPnCache {
             .insert(shared.lid.clone(), Arc::clone(&shared))
             .await;
 
+        self.contact_hash_to_lid
+            .insert(contact_hash_key(&shared.lid), Arc::clone(&shared.lid))
+            .await;
+
         // Update PN -> Entry map (only if newer or equal timestamp)
         if should_update_pn {
+            // A losing older entry must not point this number's hash at a
+            // superseded LID.
+            self.contact_hash_to_lid
+                .insert(
+                    contact_hash_key(&shared.phone_number),
+                    Arc::clone(&shared.lid),
+                )
+                .await;
             self.pn_to_entry
                 .insert(shared.phone_number.clone(), shared)
                 .await;
         }
+
         if let Some(topology) = self.topology.get() {
             topology.record([&*entry.lid, &*entry.phone_number]);
         }
+    }
+
+    /// Resolve the contact a `<devices>` `<update hash>` refers to.
+    pub(crate) async fn lid_for_contact_hash(&self, hash: [u8; 3]) -> Option<Arc<str>> {
+        self.contact_hash_to_lid.get(&pack_contact_hash(hash)).await
     }
 
     /// Whether this process has durably persisted exactly `phone -> lid`.
@@ -317,6 +355,7 @@ impl LidPnCache {
         self.lid_to_entry.clear().await;
         self.pn_to_entry.clear().await;
         self.persisted.clear().await;
+        self.contact_hash_to_lid.clear().await;
         if let Some(topology) = self.topology.get() {
             topology.record_global();
         }
@@ -437,6 +476,24 @@ mod tests {
             cache.get_current_lid("559980000001").await.as_deref(),
             Some("100000087654321")
         );
+
+        // The number's contact hash follows the same winner, or a device
+        // update naming that number would refresh the superseded LID.
+        let phone_hash = wacore::crypto::contact_notification_hash("559980000001");
+        assert_eq!(
+            cache.lid_for_contact_hash(phone_hash).await.as_deref(),
+            Some("100000087654321")
+        );
+        // Each LID still resolves to itself: the loser is a real contact too.
+        for lid in ["100000087654321", "100000012345678"] {
+            assert_eq!(
+                cache
+                    .lid_for_contact_hash(wacore::crypto::contact_notification_hash(lid))
+                    .await
+                    .as_deref(),
+                Some(lid)
+            );
+        }
     }
 
     #[tokio::test]
