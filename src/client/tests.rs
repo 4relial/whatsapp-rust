@@ -143,7 +143,9 @@ async fn test_ack_waiter_resolves() {
     // 1. Insert a waiter for a specific ID
     let test_id = "ack-test-123".to_string();
     let (tx, rx) = oneshot::channel();
-    client.response_waiters_guard().insert(test_id.clone(), tx);
+    client
+        .response_waiters_guard()
+        .insert(test_id.clone(), ResponseWaiter::Iq(tx));
     assert!(
         client.response_waiters_guard().contains_key(&test_id),
         "Waiter should be inserted before handling ack"
@@ -249,7 +251,7 @@ async fn ack_arc_delivery_shares_allocation() {
     let (tx, rx) = oneshot::channel();
     client
         .response_waiters_guard()
-        .insert(test_id.to_string(), tx);
+        .insert(test_id.to_string(), ResponseWaiter::Iq(tx));
 
     let node = Arc::new(owned_ack_node(test_id));
     assert!(client.handle_ack_response_arc(&node));
@@ -277,7 +279,7 @@ async fn ack_owned_delivery_resolves_waiter() {
     let (tx, rx) = oneshot::channel();
     client
         .response_waiters_guard()
-        .insert(test_id.to_string(), tx);
+        .insert(test_id.to_string(), ResponseWaiter::Iq(tx));
 
     assert!(client.handle_ack_response_owned(owned_ack_node(test_id)));
     let received = tokio::time::timeout(Duration::from_secs(1), rx)
@@ -370,7 +372,7 @@ async fn test_ack_dispatches_server_ack_event() {
     let (tx, rx) = oneshot::channel();
     client
         .response_waiters_guard()
-        .insert("ack-evt-3".to_string(), tx);
+        .insert("ack-evt-3".to_string(), ResponseWaiter::Iq(tx));
     let waited_ack = NodeBuilder::new("ack")
         .attr("id", "ack-evt-3")
         .attr("class", "message")
@@ -4108,4 +4110,50 @@ async fn offline_preview_defaults_absent_counts_to_zero() {
     assert_eq!(preview.total, 1);
     assert_eq!(preview.calls, 0);
     assert_eq!(preview.statuses, 0);
+}
+
+/// A phash waiter is resolved by an ack that may never arrive, and nothing
+/// polls it. The sweep has to drop the stale one, or a non-empty map reads as
+/// "IQ pending" and silences pings for the life of the connection.
+#[test]
+fn phash_waiter_sweep_drops_only_entries_that_lived_through_a_sweep() {
+    use crate::client::{PhashWaiter, ResponseWaiter, ResponseWaiterMap};
+    use futures::channel::oneshot;
+
+    let mut map = ResponseWaiterMap::default();
+    let waiter = |registered_epoch: u64| {
+        ResponseWaiter::Phash(PhashWaiter {
+            expected: wacore_binary::CompactString::from("hash"),
+            jid: "13135550100@s.whatsapp.net".parse().expect("valid jid"),
+            invalidate_group_cache: false,
+            registered_epoch,
+        })
+    };
+
+    let epoch = map.current_epoch();
+    map.insert("first".to_string(), waiter(epoch));
+    let (iq_tx, _iq_rx) = oneshot::channel();
+    map.insert("iq".to_string(), ResponseWaiter::Iq(iq_tx));
+
+    // One sweep is not enough: the waiter registered in the current epoch is
+    // still within its window, so an ack in flight is not discarded early.
+    map.drop_expired_phash();
+    assert!(
+        map.remove("first").is_some(),
+        "a waiter must survive the sweep of the epoch it registered in"
+    );
+
+    // Registered before a sweep, then swept again: now it is stale.
+    let epoch = map.current_epoch();
+    map.insert("stale".to_string(), waiter(epoch));
+    map.drop_expired_phash();
+    map.drop_expired_phash();
+    assert!(
+        map.remove("stale").is_none(),
+        "a waiter that lived through a full sweep must be dropped"
+    );
+    assert!(
+        map.remove("iq").is_some(),
+        "the sweep must never touch IQ waiters, which have their own cleanup"
+    );
 }

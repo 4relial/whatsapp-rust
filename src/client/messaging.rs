@@ -269,14 +269,49 @@ impl Client {
     /// Register a oneshot waiter for a server ack by message ID.
     /// Returns the receiver — caller sends the node separately and awaits this in background.
     /// Sync: registration is just a `std::sync::Mutex` insert (no await).
+    /// Register a waiter that receives the ack node itself.
+    ///
+    /// Used where the caller needs the response: the VoIP offer reads the relay
+    /// out of its ack. A phash check does not, which is why that path uses
+    /// [`Self::register_phash_waiter`] and pays no channel per message. Gated on
+    /// the only consumer's feature, or it is dead code in a default build.
+    #[cfg(feature = "voip-runtime")]
     pub(crate) fn register_ack_waiter(
         &self,
         message_id: &str,
     ) -> futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>> {
         let (tx, rx) = futures::channel::oneshot::channel();
         self.response_waiters_guard()
-            .insert(message_id.to_string(), tx);
+            .insert(message_id.to_string(), ResponseWaiter::Iq(tx));
         rx
+    }
+
+    /// Register the phash the server is expected to echo for this send.
+    ///
+    /// Nothing awaits the result: the read loop compares inline when the ack
+    /// lands and only acts on a mismatch, so a send costs a map entry instead of
+    /// a task, a oneshot and a timer.
+    pub(crate) fn register_phash_waiter(
+        &self,
+        message_id: &str,
+        expected: wacore_binary::CompactString,
+        jid: Jid,
+        invalidate_group_cache: bool,
+    ) {
+        let mut waiters = self.response_waiters_guard();
+        // Stamped with the sweep epoch under the lock the insert already holds:
+        // a deadline derived from the instant the send started would already be
+        // stale here when preparation is slow, and a wall clock can jump.
+        let registered_epoch = waiters.current_epoch();
+        waiters.insert(
+            message_id.to_string(),
+            ResponseWaiter::Phash(PhashWaiter {
+                expected,
+                jid,
+                invalidate_group_cache,
+                registered_epoch,
+            }),
+        );
     }
 
     /// Creates a normalized ChatMessageId by resolving PN to LID JIDs.

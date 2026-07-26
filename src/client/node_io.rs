@@ -1,6 +1,7 @@
 //! Inbound node I/O: read loop, frame decryption, node routing, acks and stream errors.
 
 use super::*;
+use crate::client::{PhashWaiter, ResponseWaiter};
 use wacore::net::DisconnectReason;
 
 /// Non-error exits of [`Client::read_messages_loop`] — `ServerRecycle` keeps the
@@ -478,8 +479,17 @@ impl Client {
             && let Some(id) = nr.get_attr("id").map(|v| v.as_str())
             && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
         {
-            if waiter.send(Arc::clone(&node)).is_err() {
-                warn!(target: "Client/IQ", "Failed to send IQ response to waiter. Receiver was likely dropped.");
+            // An IQ id never carries a phash waiter (those are registered under
+            // message ids), so a mismatch here means the id space collided.
+            match waiter {
+                ResponseWaiter::Iq(sender) => {
+                    if sender.send(Arc::clone(&node)).is_err() {
+                        warn!(target: "Client/IQ", "Failed to send IQ response to waiter. Receiver was likely dropped.");
+                    }
+                }
+                ResponseWaiter::Phash(_) => {
+                    warn!(target: "Client/IQ", "IQ id collided with a pending phash waiter; dropping the phash check");
+                }
             }
             return;
         }
@@ -614,9 +624,12 @@ impl Client {
         }
     }
 
-    /// Possibly send a deferred ack: either immediately or via spawned task.
-    /// Handlers can cancel by setting `cancelled` to true.
-    /// Uses Arc<OwnedNodeRef> to avoid cloning when spawning the async task.
+    /// Possibly send a deferred ack: either immediately or through the ack
+    /// worker. Handlers can cancel by setting `cancelled` to true.
+    /// Uses Arc<OwnedNodeRef> so queueing does not clone the node.
+    ///
+    /// The deferred path feeds one persistent worker rather than spawning a
+    /// task per ack, which also makes acks leave in arrival order.
     async fn maybe_deferred_ack(self: &Arc<Self>, node: Arc<wacore_binary::OwnedNodeRef>) {
         if self.synchronous_ack {
             if let Err(e) = self.send_ack_for(node.get()).await
@@ -624,18 +637,50 @@ impl Client {
             {
                 warn!("Failed to send ack: {e:?}");
             }
-        } else {
-            let this = self.clone();
-            self.runtime
-                .spawn(Box::pin(async move {
-                    if let Err(e) = this.send_ack_for(node.get()).await
+            return;
+        }
+        // A closed scope means disconnect is already running; the spawned task
+        // it replaces would have failed on an unavailable transport anyway.
+        let Some(guard) = self.outbound_flush.try_track() else {
+            return;
+        };
+        let tx = self
+            .transport_ack_queue
+            .get_or_init(|| self.start_transport_ack_worker());
+        // Only fails once the worker is gone (client teardown).
+        let _ = tx.try_send((node, guard));
+    }
+
+    /// Worker shared by every deferred ack. Holds a `Weak`, so a dropped
+    /// `Client` closes the channel and ends the task instead of keeping the
+    /// client alive.
+    fn start_transport_ack_worker(
+        self: &Arc<Self>,
+    ) -> async_channel::Sender<(
+        Arc<wacore_binary::OwnedNodeRef>,
+        crate::flush_scope::FlushGuard,
+    )> {
+        let (tx, rx) = async_channel::unbounded::<(
+            Arc<wacore_binary::OwnedNodeRef>,
+            crate::flush_scope::FlushGuard,
+        )>();
+        let client = Arc::downgrade(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                while let Ok((node, guard)) = rx.recv().await {
+                    let Some(client) = client.upgrade() else {
+                        break;
+                    };
+                    if let Err(e) = client.send_ack_for(node.get()).await
                         && !e.is_transport_unavailable()
                     {
                         warn!("Failed to send ack: {e:?}");
                     }
-                }))
-                .detach();
-        }
+                    drop(guard);
+                }
+            }))
+            .detach();
+        tx
     }
 
     #[inline]
@@ -1269,12 +1314,20 @@ impl Client {
 
     /// Ack entry point for callers that already share the node: the waiter
     /// receives an `Arc` clone instead of a ~1 KB re-encode + re-parse.
-    pub(crate) fn handle_ack_response_arc(&self, node: &Arc<wacore_binary::OwnedNodeRef>) -> bool {
+    pub(crate) fn handle_ack_response_arc(
+        self: &Arc<Self>,
+        node: &Arc<wacore_binary::OwnedNodeRef>,
+    ) -> bool {
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
-        if let Err(rejected) = waiter.send(Arc::clone(node)) {
-            Self::warn_ack_waiter_dropped(&rejected);
+        match waiter {
+            ResponseWaiter::Iq(sender) => {
+                if let Err(rejected) = sender.send(Arc::clone(node)) {
+                    Self::warn_ack_waiter_dropped(&rejected);
+                }
+            }
+            ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
         }
         true
     }
@@ -1282,14 +1335,52 @@ impl Client {
     /// Ack entry point for the read-loop fast path, which owns the node: the
     /// `Arc` is built from the existing allocation, and only when a waiter is
     /// actually waiting.
-    pub(crate) fn handle_ack_response_owned(&self, node: wacore_binary::OwnedNodeRef) -> bool {
+    pub(crate) fn handle_ack_response_owned(
+        self: &Arc<Self>,
+        node: wacore_binary::OwnedNodeRef,
+    ) -> bool {
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
-        if let Err(rejected) = waiter.send(Arc::new(node)) {
-            Self::warn_ack_waiter_dropped(&rejected);
+        match waiter {
+            ResponseWaiter::Iq(sender) => {
+                if let Err(rejected) = sender.send(Arc::new(node)) {
+                    Self::warn_ack_waiter_dropped(&rejected);
+                }
+            }
+            ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
         }
         true
+    }
+
+    /// Inline half of the phash check. The comparison is a string equality on
+    /// the read loop; only a disagreement pays for a task, and that path
+    /// re-reads caches and can force a sender-key redistribution.
+    fn check_phash_against_ack(
+        self: &Arc<Self>,
+        node: &wacore_binary::NodeRef<'_>,
+        waiter: PhashWaiter,
+    ) {
+        let Some(server) = node.get_attr("phash") else {
+            return;
+        };
+        if server.as_str() == waiter.expected {
+            return;
+        }
+        let client = Arc::clone(self);
+        let server = server.as_str().to_string();
+        self.runtime
+            .spawn(Box::pin(async move {
+                client
+                    .handle_phash_mismatch(
+                        &waiter.jid,
+                        &waiter.expected,
+                        &server,
+                        waiter.invalidate_group_cache,
+                    )
+                    .await;
+            }))
+            .detach();
     }
 
     fn warn_ack_waiter_dropped(rejected: &Arc<wacore_binary::OwnedNodeRef>) {
@@ -1306,10 +1397,7 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.conn.ack_response", level = "debug", skip_all)
     )]
-    fn take_ack_waiter(
-        &self,
-        node: &wacore_binary::NodeRef<'_>,
-    ) -> Option<futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>> {
+    fn take_ack_waiter(&self, node: &wacore_binary::NodeRef<'_>) -> Option<ResponseWaiter> {
         let ack_id = node.get_attr("id");
         let ack_error = node.get_attr("error");
 
