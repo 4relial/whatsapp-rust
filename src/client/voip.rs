@@ -1,5 +1,5 @@
-//! Call-control accessor. Signaling (reject/terminate) is always available since
-//! the stanza builders live in core; media (call/accept) needs the `voip` feature.
+//! Call-control accessor. Reject/terminate are always available since their stanza builders live in
+//! core; the high-level call/accept flows, including their signaling, need the `voip` feature.
 
 #[cfg(feature = "voip-runtime")]
 use std::sync::Arc;
@@ -29,6 +29,22 @@ impl Client {
     pub(crate) fn call_registry(&self) -> Arc<wacore::voip::CallRegistry> {
         self.call_registry.clone()
     }
+
+    /// Lock the striped answer-transition lane for `call_id`. Incoming answer registration and
+    /// answer teardown both use this, preventing a replacement generation from being installed
+    /// after the old one is claimed but before its terminal stanza reaches the wire.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn lock_answer_transition(
+        &self,
+        call_id: &str,
+    ) -> async_lock::MutexGuardArc<()> {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        call_id.hash(&mut hasher);
+        let lane = hasher.finish() as usize % self.answer_transition_locks.len();
+        self.answer_transition_locks[lane].clone().lock_arc().await
+    }
 }
 
 /// Errors from call-control operations. `#[non_exhaustive]` so new variants stay
@@ -52,6 +68,14 @@ pub enum CallError {
     #[cfg(feature = "voip-runtime")]
     #[error("incoming offer does not advertise the selected audio rate {0}")]
     AudioFormatNotOffered(u32),
+    /// Video endpoints were supplied for an offer that only advertised audio.
+    #[cfg(feature = "voip-runtime")]
+    #[error("incoming offer did not advertise video; use start_video() after answering")]
+    VideoNotOffered,
+    /// The peer ended or superseded the call while the answer was being prepared.
+    #[cfg(feature = "voip-runtime")]
+    #[error("call ended during answer setup")]
+    CallEndedDuringSetup,
     /// Decrypting the offer's encrypted callKey failed.
     #[cfg(feature = "voip-runtime")]
     #[error("callKey decrypt failed: {0}")]
@@ -120,11 +144,11 @@ impl Voip<'_> {
         Ok(())
     }
 
-    /// Begin answering an incoming call's MEDIA plane: returns a builder; call
-    /// `.audio(source, sink)` then `.start().await` to decrypt the callKey, connect the relay, and
-    /// drive the call, yielding a [`CallHandle`](crate::voip::CallHandle). Signaling (preaccept /
-    /// accept) is the consumer's concern; this drives only media. Requires `voip-runtime` or a
-    /// profile that enables it: `voip`, `voip-encoded`, `voip-mlow`, or `voip-libopus`.
+    /// Begin answering an incoming call: returns a builder; call `.audio(source, sink)` then
+    /// `.start().await` to send `<preaccept>`, decrypt the callKey, send `<accept>`, connect the relay,
+    /// and drive the call, yielding a [`CallHandle`](crate::voip::CallHandle). Requires
+    /// `voip-runtime` or a profile that enables it: `voip`, `voip-encoded`, `voip-mlow`, or
+    /// `voip-libopus`.
     #[cfg(feature = "voip-runtime")]
     pub fn accept<'b>(&'b self, incoming: &'b IncomingCall) -> crate::voip::AcceptCall<'b> {
         crate::voip::facade::AcceptCall::new(self.client, incoming)
