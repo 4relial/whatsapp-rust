@@ -169,7 +169,7 @@ struct SendBranchOutput {
 struct GroupBranchRequest<'a> {
     to: Jid,
     message: &'a wa::Message,
-    request_id: String,
+    request_id: &'a str,
     force_key_distribution: bool,
     edit: Option<EditAttribute>,
     extra_stanza_nodes: &'a [Node],
@@ -181,7 +181,7 @@ struct GroupBranchRequest<'a> {
 struct DmBranchRequest<'a> {
     to: Jid,
     message: &'a wa::Message,
-    request_id: String,
+    request_id: &'a str,
     sent_at: SendInstant,
     edit: Option<EditAttribute>,
     extra_stanza_nodes: Vec<Node>,
@@ -396,11 +396,14 @@ impl SendInstant {
 }
 
 #[derive(Default)]
-pub(crate) struct SendPipelineOptions {
+pub(crate) struct SendPipelineOptions<'a> {
     /// Instant this operation is stamped with, when the caller already sampled
     /// one. `None` makes [`Client::send_message_impl`] sample its own.
     pub(crate) sent_at: Option<SendInstant>,
-    pub(crate) request_id: Option<String>,
+    /// Borrowed on purpose: the caller that already owns an id (because it
+    /// returns it, or stamped state with it) lends it for the whole send
+    /// instead of handing over a copy.
+    pub(crate) request_id: Option<&'a str>,
     pub(crate) peer: bool,
     pub(crate) force_key_distribution: bool,
     pub(crate) edit: Option<EditAttribute>,
@@ -918,11 +921,10 @@ impl Client {
             Some(id) => id,
             None => self.generate_message_id_at(sent_at.unix_secs_u64()),
         };
-        // Both paths below consume `to` and `request_id`, so save copies for the result.
-        let result = SendResult {
-            message_id: request_id.clone(),
-            to: to.clone(),
-        };
+        // Both paths below consume `to`, so save a copy for the result. The id
+        // is not copied: it is lent to the pipeline as `&str` and moved into
+        // the result once the send returns.
+        let result_to = to.clone();
 
         // Newsletters are not E2E encrypted — send as plaintext via SMAX stanza.
         // Matches WA Web's OutMessagePublishNewsletterRequest + ContentType mixins.
@@ -949,7 +951,10 @@ impl Client {
                 .children(children)
                 .build();
             self.send_node(stanza).await?;
-            return Ok(result);
+            return Ok(SendResult {
+                message_id: request_id,
+                to: result_to,
+            });
         }
 
         let (edit, inferred_meta) = infer_stanza_metadata(&message);
@@ -966,7 +971,7 @@ impl Client {
             &message,
             SendPipelineOptions {
                 sent_at: Some(sent_at),
-                request_id: Some(request_id),
+                request_id: Some(&request_id),
                 edit,
                 extra_stanza_nodes: extra_nodes,
                 stanza_type: stanza_type_override,
@@ -977,7 +982,10 @@ impl Client {
         )
         .await
         .map_err(SendError::from_anyhow)?;
-        Ok(result)
+        Ok(SendResult {
+            message_id: request_id,
+            to: result_to,
+        })
     }
 
     /// Send a status/story update using sender-key encryption.
@@ -1617,7 +1625,7 @@ impl Client {
         &self,
         to: Jid,
         message: &wa::Message,
-        options: SendPipelineOptions,
+        options: SendPipelineOptions<'_>,
     ) -> Result<(), anyhow::Error> {
         let SendPipelineOptions {
             sent_at,
@@ -1635,7 +1643,7 @@ impl Client {
         // rest sample here so the pipeline below still has exactly one.
         let sent_at = sent_at.unwrap_or_else(SendInstant::now);
         validate_extra_stanza_nodes(&extra_stanza_nodes)?;
-        if request_id_override.as_ref().is_some_and(String::is_empty) {
+        if request_id_override.is_some_and(str::is_empty) {
             return Err(SendError::InvalidRequest("message ID must not be empty".into()).into());
         }
         // Newsletters are plaintext channels and never use the E2E path. Text
@@ -1675,16 +1683,18 @@ impl Client {
             (to, false)
         };
 
-        // Generate request ID early (doesn't need lock)
-        let request_id = match request_id_override {
+        // Generate request ID early (doesn't need lock). This frame owns the
+        // only copy for the whole send: the branch builders, the phash waiter
+        // and the messageSecret persistence all borrow it, so a send names its
+        // message exactly once no matter how many stages read that name.
+        let generated_request_id;
+        let request_id: &str = match request_id_override {
             Some(id) => id,
-            None => self.generate_message_id_at(sent_at.unix_secs_u64()),
+            None => {
+                generated_request_id = self.generate_message_id_at(sent_at.unix_secs_u64());
+                &generated_request_id
+            }
         };
-        // `request_id` is moved into the branch-specific stanza builders below;
-        // keep a copy for the post-send messageSecret persistence (the secret
-        // itself is generated inside prepare_dm/group_stanza, not on `message`,
-        // so it's threaded back out via PreparedStanza.message_secret below).
-        let outbound_id_clone = request_id.clone();
         let tc_issue_target = to.clone();
 
         // Dispatch to a concrete boxed future per branch: this function's own
@@ -1745,18 +1755,25 @@ impl Client {
         // Registered before the stanza goes out: the ack can arrive while
         // send_node is still returning, and a waiter installed afterwards would
         // miss it.
-        let ack_message_id = if !borrowed_message_id
-            && let Some(phash) = dm_phash
-            && let Some(msg_id) = stanza_to_send
-                .attrs()
-                .optional_string("id")
-                .map(|s| s.into_owned())
-        {
+        // Keying the waiter off `request_id` rather than re-reading the stanza
+        // is only sound while every branch stamps the id it was handed; assert
+        // that instead of paying an owned copy of an attribute we already have.
+        debug_assert_eq!(
+            stanza_to_send.attrs().optional_string("id").as_deref(),
+            Some(request_id),
+            "branch stanza must carry the id this send was named with"
+        );
+        let ack_message_id = if !borrowed_message_id && let Some(phash) = dm_phash {
             // Group sends also invalidate group cache on mismatch: the server's
             // participant set diverged, so the next send needs a fresh query.
             let invalidate_group = tc_issue_target.is_group();
-            self.register_phash_waiter(&msg_id, phash, tc_issue_target.clone(), invalidate_group);
-            Some(msg_id)
+            self.register_phash_waiter(
+                request_id,
+                phash,
+                tc_issue_target.clone(),
+                invalidate_group,
+            );
+            Some(request_id)
         } else {
             None
         };
@@ -1772,7 +1789,7 @@ impl Client {
         }
 
         if let Err(e) = self.send_node(stanza_to_send).await {
-            if let Some(ref msg_id) = ack_message_id {
+            if let Some(msg_id) = ack_message_id {
                 self.response_waiters_guard().remove(msg_id);
             }
             return Err(e.into());
@@ -1791,7 +1808,7 @@ impl Client {
                 self.persist_outbound_msg_secret(
                     &tc_issue_target,
                     &sender,
-                    &outbound_id_clone,
+                    request_id,
                     secret,
                     class,
                     sent_at,
@@ -1834,7 +1851,7 @@ impl Client {
         &self,
         to: Jid,
         message: &wa::Message,
-        request_id: String,
+        request_id: &str,
     ) -> Result<SendBranchOutput, anyhow::Error> {
         let node = {
             // Peer messages are only valid for individual users, not groups
@@ -1913,7 +1930,7 @@ impl Client {
             // the id is borrowed: it would replace the original message's
             // retry-cache entry, so a retry receipt for it returns this edit.
             if !borrowed_message_id {
-                self.add_recent_message(&to, &request_id, message, shared_content.clone())
+                self.add_recent_message(&to, request_id, message, shared_content.clone())
                     .await;
             }
 
@@ -2123,7 +2140,7 @@ impl Client {
                     account: account_info.as_deref(),
                     to: &to,
                     message,
-                    message_id: &request_id,
+                    message_id: request_id,
                     force_distribution: force_skdm,
                     distribution_targets: skdm_target_devices,
                     distribution_policy: wacore::send::SenderKeyDistributionPolicy::BestEffort,
@@ -2203,7 +2220,7 @@ impl Client {
                                 account: account_info.as_deref(),
                                 to: &to,
                                 message,
-                                message_id: &request_id,
+                                message_id: request_id,
                                 force_distribution: retry_force,
                                 distribution_targets: retry_targets,
                                 distribution_policy:
@@ -2276,13 +2293,13 @@ impl Client {
                 if is_status_addon {
                     self.add_recent_message(
                         &Jid::status_broadcast(),
-                        &request_id,
+                        request_id,
                         message,
                         shared_content.clone(),
                     )
                     .await;
                 } else {
-                    self.add_recent_message(&to, &request_id, message, shared_content.clone())
+                    self.add_recent_message(&to, request_id, message, shared_content.clone())
                         .await;
                 }
             }
@@ -2361,11 +2378,7 @@ impl Client {
             }
 
             let lock_jids = self.build_session_lock_keys(dm_devices.devices()).await;
-            let _session_mutexes = self.session_mutexes_for(&lock_jids).await;
-            let mut _session_guards = Vec::with_capacity(_session_mutexes.len());
-            for mutex in &_session_mutexes {
-                _session_guards.push(mutex.lock().await);
-            }
+            let _session_guards = self.session_guards_for(&lock_jids).await;
 
             let mut store_adapter = self.signal_adapter().await;
 
@@ -2380,7 +2393,7 @@ impl Client {
                     account: device_snapshot.account.as_deref(),
                     to: &stanza_to,
                     message,
-                    message_id: &request_id,
+                    message_id: request_id,
                     edit: edit.as_ref(),
                     extra_nodes: &extra_stanza_nodes,
                     devices: &dm_devices,
@@ -2465,16 +2478,57 @@ impl Client {
         keys
     }
 
-    /// Fetch per-device session mutexes in deadlock-free order.
+    /// Take every per-device session lock, in `jids` order.
+    ///
+    /// INVARIANT: acquisition order IS `jids` order, and callers pass keys from
+    /// [`Self::build_session_lock_keys`], which sorts them. That single order is
+    /// what keeps two sends overlapping on a device from deadlocking, so a
+    /// change here has to preserve it.
+    ///
+    /// Each mutex is locked as it is resolved rather than resolving the whole
+    /// set first: the handles exist only to be locked, so the vector holding
+    /// them was pure staging. The guards themselves must still be collected —
+    /// they are what keeps the locks held for the caller's scope.
+    pub(crate) async fn session_guards_for(
+        &self,
+        jids: &[Jid],
+    ) -> Vec<async_lock::MutexGuardArc<()>> {
+        // A duplicate key would have this loop await a lock it already holds,
+        // which is a silent self-deadlock rather than a panic: the send just
+        // never returns. Every caller goes through `build_session_lock_keys`,
+        // which sorts and dedups, so this only fires if a future path forgets
+        // to.
+        debug_assert!(
+            jids.windows(2).all(|pair| pair[0] != pair[1]),
+            "session lock keys must be deduped before acquisition, or the loop deadlocks on itself"
+        );
+
+        let mut guards = Vec::with_capacity(jids.len());
+        // A `ProtocolAddress` IS the "{name}.0" string the lock map is keyed by,
+        // and it holds it inline, so the whole loop names its keys without
+        // allocating a formatting buffer.
+        let mut addr = wacore::types::jid::make_reusable_protocol_address();
+        for jid in jids {
+            jid.reset_protocol_address(&mut addr);
+            let mutex = self.session_lock_for(addr.as_str()).await;
+            guards.push(mutex.lock_arc().await);
+        }
+        guards
+    }
+
+    /// The mutexes [`Self::session_guards_for`] would take, without taking
+    /// them. Only tests need this: production code always wants the guards, and
+    /// resolving handles it does not lock is what this commit removed.
+    #[cfg(test)]
     pub(crate) async fn session_mutexes_for(
         &self,
         jids: &[Jid],
     ) -> Vec<std::sync::Arc<async_lock::Mutex<()>>> {
         let mut mutexes = Vec::with_capacity(jids.len());
-        let mut buf = wacore::types::jid::make_address_buffer();
+        let mut addr = wacore::types::jid::make_reusable_protocol_address();
         for jid in jids {
-            wacore::types::jid::write_protocol_address_to(jid, &mut buf);
-            mutexes.push(self.session_lock_for(&buf).await);
+            jid.reset_protocol_address(&mut addr);
+            mutexes.push(self.session_lock_for(addr.as_str()).await);
         }
         mutexes
     }
@@ -4541,6 +4595,88 @@ mod tests {
                 "100000012345678@lid.0"
             );
         }
+
+        /// Every key handed in ends up locked, and every one is released when
+        /// the guards are dropped. The device counts are the three the DM path
+        /// actually produces: none (a fan-out that resolved to nothing), one
+        /// (a steady 1:1) and several (companion devices in play).
+        #[tokio::test]
+        async fn taking_guards_locks_every_key_and_releasing_them_frees_every_key() {
+            let client = crate::test_utils::create_test_client_with_name("guards_cover").await;
+
+            for count in [0usize, 1, 3] {
+                let devices: Vec<Jid> = (0..count)
+                    .map(|i| Jid::from_str(&format!("10000001234567{i}:5@lid")).unwrap())
+                    .collect();
+                let keys = client.build_session_lock_keys(&devices).await;
+                assert_eq!(keys.len(), count, "one key per device at count {count}");
+                let mutexes = client.session_mutexes_for(&keys).await;
+
+                let guards = client.session_guards_for(&keys).await;
+                assert_eq!(guards.len(), count, "one guard per key at count {count}");
+                for (i, mutex) in mutexes.iter().enumerate() {
+                    assert!(
+                        mutex.try_lock().is_none(),
+                        "key {i} of {count} must be held while the guards live"
+                    );
+                }
+
+                drop(guards);
+                for (i, mutex) in mutexes.iter().enumerate() {
+                    assert!(
+                        mutex.try_lock().is_some(),
+                        "key {i} of {count} must be free once the guards are dropped"
+                    );
+                }
+            }
+        }
+
+        /// The keys are locked in the order given, which is the sorted order
+        /// `build_session_lock_keys` produces. That single global order is the
+        /// only thing keeping two sends that overlap on a device from
+        /// deadlocking, so acquiring out of order must be observable.
+        ///
+        /// Blocking the SECOND key and then waiting for the FIRST to become
+        /// contended is what pins the order down: a taker that went second-first
+        /// would park on the blocked key and never touch the first one.
+        #[tokio::test]
+        async fn keys_are_locked_in_the_order_they_are_given() {
+            let client = crate::test_utils::create_test_client_with_name("guards_order").await;
+
+            let devices: Vec<Jid> = ["100000012345670:5@lid", "100000012345671:5@lid"]
+                .iter()
+                .map(|s| Jid::from_str(s).unwrap())
+                .collect();
+            let keys = client.build_session_lock_keys(&devices).await;
+            assert_eq!(keys.len(), 2);
+            let mutexes = client.session_mutexes_for(&keys).await;
+
+            let blocker = mutexes[1].lock_arc().await;
+
+            let mut taker = tokio::spawn({
+                let client = client.clone();
+                let keys = keys.clone();
+                async move { client.session_guards_for(&keys).await.len() }
+            });
+
+            // Bounded work, not a deadline: yield until the first key is taken.
+            let mut polls = 0;
+            while mutexes[0].try_lock().is_some() {
+                polls += 1;
+                assert!(
+                    polls < 10_000,
+                    "the first key was never taken, so acquisition did not start there"
+                );
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                futures::poll!(&mut taker).is_pending(),
+                "the taker must still be parked on the second key"
+            );
+
+            drop(blocker);
+            assert_eq!(taker.await.expect("taker finishes"), 2);
+        }
     }
 
     // ---- outbound messageSecret capture ---------------------------------
@@ -4657,7 +4793,7 @@ mod tests {
                 peer,
                 &msg,
                 SendPipelineOptions {
-                    request_id: Some(request_id.to_string()),
+                    request_id: Some(request_id),
                     peer: true,
                     ..Default::default()
                 },
@@ -4710,7 +4846,7 @@ mod tests {
                 peer,
                 &msg,
                 SendPipelineOptions {
-                    request_id: Some(request_id.to_string()),
+                    request_id: Some(request_id),
                     peer: true,
                     stanza_type: Some(StanzaType::Poll),
                     ..Default::default()
@@ -4875,7 +5011,7 @@ mod tests {
                 peer_pn,
                 &msg,
                 SendPipelineOptions {
-                    request_id: Some(request_id.to_string()),
+                    request_id: Some(request_id),
                     ..Default::default()
                 },
             )
@@ -4951,7 +5087,7 @@ mod tests {
                 peer_pn.clone(),
                 &msg,
                 SendPipelineOptions {
-                    request_id: Some(request_id.to_string()),
+                    request_id: Some(request_id),
                     ..Default::default()
                 },
             )
@@ -5409,6 +5545,204 @@ mod tests {
             message_secret: Some(result.message_secret),
         };
         assert_eq!(prepared.message_secret.as_ref().unwrap().len(), 32);
+    }
+
+    /// A send names its message once and every downstream stage reads that same
+    /// name: the wire stanza, the phash ack-waiter, the outbound messageSecret
+    /// and the returned `SendResult`. A non-ASCII id is used on purpose — a
+    /// truncating or byte-indexing copy anywhere in that chain would show up
+    /// here and nowhere else.
+    #[tokio::test]
+    async fn one_id_names_the_stanza_the_waiter_the_secret_and_the_result() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+
+        let message_id = "ID_ünïcødé_✅_ONE";
+        let result = client
+            .send_message_with_options(
+                peer_pn.clone(),
+                wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+                SendOptions::default().with_message_id(message_id),
+            )
+            .await
+            .expect("connected test client should complete the send");
+
+        assert_eq!(
+            result.message_id, message_id,
+            "result carries the caller id"
+        );
+        assert_eq!(result.to, peer_pn, "result carries the caller target");
+
+        let waiters = client.response_waiters_guard();
+        assert!(
+            waiters.contains_key(message_id),
+            "the phash ack-waiter must be keyed by the send's own id"
+        );
+        assert_eq!(waiters.len(), 1, "no second entry under another spelling");
+        drop(waiters);
+
+        let secret = client.msg_secret_buffer.lookup(
+            &peer_pn.to_non_ad_string(),
+            &client.pn().expect("own pn").to_non_ad_string(),
+            message_id,
+        );
+        assert!(
+            secret.is_some(),
+            "the outbound messageSecret must be bound to the same id"
+        );
+    }
+
+    /// The waiter is installed before the stanza reaches the socket (a fast ack
+    /// can land while `send_node` is still returning), so a send that fails on
+    /// the wire has to take it back out — under the id it registered. Removing
+    /// under anything else leaks an entry that a later ack could resolve.
+    #[tokio::test]
+    async fn a_failed_send_takes_its_phash_waiter_back_out() {
+        let client = crate::test_utils::create_test_client_with_name("phash_waiter_rollback").await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+
+        let message_id = "ID_ünïcødé_✅_ROLLBACK";
+        let result = client
+            .send_message_impl(
+                peer_pn,
+                &wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+                SendPipelineOptions {
+                    request_id: Some(message_id),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_err(), "no socket: the send must fail on the wire");
+        assert_eq!(
+            client.response_waiters_guard().len(),
+            0,
+            "a failed send must leave no waiter behind, under any key"
+        );
+    }
+
+    /// A borrowed id belongs to another message: registering a waiter under it
+    /// would overwrite the original send's waiter, and binding a secret under it
+    /// would overwrite the original's secret.
+    #[tokio::test]
+    async fn a_borrowed_id_registers_no_waiter_and_binds_no_secret() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+
+        let message_id = "ID_BORROWED_1";
+        client
+            .send_message_impl(
+                peer_pn.clone(),
+                &wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+                SendPipelineOptions {
+                    request_id: Some(message_id),
+                    borrowed_message_id: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("connected test client should complete the send");
+
+        assert_eq!(
+            client.response_waiters_guard().len(),
+            0,
+            "a borrowed id must not claim the waiter slot"
+        );
+        assert!(
+            client
+                .msg_secret_buffer
+                .lookup(
+                    &peer_pn.to_non_ad_string(),
+                    &client.pn().expect("own pn").to_non_ad_string(),
+                    message_id,
+                )
+                .is_none(),
+            "a borrowed id must not claim the secret slot"
+        );
+    }
+
+    /// An empty id would name nothing: it must be refused at both entry points
+    /// before any state is stamped with it.
+    #[tokio::test]
+    async fn an_empty_id_is_refused_at_both_entry_points() {
+        let client = crate::test_utils::create_test_client_with_name("empty_send_id").await;
+        let peer: Jid = "100000000000777@s.whatsapp.net".parse().unwrap();
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let public = client
+            .send_message_with_options(
+                peer.clone(),
+                msg.clone(),
+                SendOptions::default().with_message_id(""),
+            )
+            .await;
+        assert!(
+            matches!(public, Err(SendError::InvalidRequest(_))),
+            "public send must reject an empty id, got {public:?}"
+        );
+
+        let internal = client
+            .send_message_impl(
+                peer,
+                &msg,
+                SendPipelineOptions {
+                    request_id: Some(""),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let internal = internal.expect_err("internal send must reject an empty id");
+        assert!(
+            internal
+                .to_string()
+                .contains("message ID must not be empty"),
+            "unexpected error: {internal}"
+        );
+    }
+
+    /// The plaintext newsletter branch returns before the E2E pipeline, so it
+    /// builds its own result; it must still hand back the id it stamped and the
+    /// channel it addressed.
+    #[tokio::test]
+    async fn the_newsletter_branch_returns_the_id_and_target_it_stamped() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let channel: Jid = "123456789@newsletter".parse().unwrap();
+
+        let message_id = "ID_ünïcødé_✅_NEWS";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", message_id));
+        let result = client
+            .send_message_with_options(
+                channel.clone(),
+                wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+                SendOptions::default().with_message_id(message_id),
+            )
+            .await
+            .expect("newsletter send is plaintext and needs no session");
+
+        assert_eq!(result.message_id, message_id);
+        assert_eq!(result.to, channel);
+
+        let node = waiter.await.expect("the stanza should be captured");
+        assert_eq!(
+            node.attrs().optional_string("id").as_deref(),
+            Some(message_id),
+            "the wire id must be the same one the result reports"
+        );
     }
 }
 
