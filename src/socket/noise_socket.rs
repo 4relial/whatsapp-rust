@@ -259,21 +259,34 @@ impl NoiseSocket {
             }
 
             // Every frame in this batch shares the fate of the single write.
-            // EncryptSendError carries an anyhow::Error and is not Clone, and
-            // its Display renders only the kind, so flattening the failure to a
-            // string would hand every caller "transport error" with the actual
-            // cause discarded. Sharing one Arc keeps the whole chain intact for
-            // all of them at the cost of a refcount bump each.
-            let failure = match outcome {
-                Ok(()) => None,
-                Err(err) => Some(Arc::new(err)),
-            };
-            for (response_tx, _) in waiters.drain(..) {
-                let result = match &failure {
-                    None => Ok(()),
-                    Some(err) => Err(EncryptSendError::transport(SharedSendFailure(err.clone()))),
-                };
-                let _ = response_tx.send(result);
+            match outcome {
+                Ok(()) => {
+                    for (response_tx, _) in waiters.drain(..) {
+                        let _ = response_tx.send(Ok(()));
+                    }
+                }
+                // One waiter owns the failure outright. This is the overwhelmingly
+                // common case, and handing over the error untouched is what keeps
+                // `err.source.downcast_ref::<MyTransportError>()` working for a
+                // caller with its own Transport: wrapping would bury the typed
+                // error one level down for no benefit, since there is nobody to
+                // share it with.
+                Err(err) if waiters.len() == 1 => {
+                    let (response_tx, _) = waiters.drain(..).next().expect("length checked");
+                    let _ = response_tx.send(Err(err));
+                }
+                // Several waiters, and EncryptSendError is not Clone: they share
+                // one Arc. Display renders only the kind, so re-wording per waiter
+                // would hand each caller "transport error" with the cause gone;
+                // sharing keeps the whole chain reachable for a refcount bump each.
+                Err(err) => {
+                    let shared = Arc::new(err);
+                    for (response_tx, _) in waiters.drain(..) {
+                        let _ = response_tx.send(Err(EncryptSendError::transport(
+                            SharedSendFailure(shared.clone()),
+                        )));
+                    }
+                }
             }
             if let Some((response_tx, err)) = encrypt_failure {
                 let _ = response_tx.send(Err(err));
@@ -672,6 +685,121 @@ mod tests {
                 .expect("each frame must decrypt under its own distinct counter");
             assert_eq!(body, vec![counter as u8; 32]);
         }
+    }
+
+    /// Order must survive a full job channel, not just an empty one.
+    ///
+    /// A burst larger than the channel leaves some sends parked waiting for a
+    /// slot, and the whole ordering guarantee (`send_raw_bytes_burst` promises
+    /// arrival order, and the ack worker relies on it) then rests on those
+    /// parked senders being woken in the order they queued. Frame N decrypts
+    /// only under counter N, so any reordering fails here.
+    #[tokio::test]
+    async fn order_survives_a_full_job_channel() {
+        let key = [0x88u8; 32];
+        let transport = GatedTransport::closed();
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let socket = Arc::new(NoiseSocket::new(
+            runtime,
+            transport.clone(),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        ));
+
+        // Comfortably past the channel's capacity, so later sends must park.
+        const FRAMES: usize = 20;
+        let sends: Vec<BoxSend> = (0..FRAMES)
+            .map(|i| {
+                let socket = socket.clone();
+                Box::pin(async move {
+                    socket
+                        .encrypt_and_send(bytes::Bytes::from(vec![i as u8; 32]))
+                        .await
+                }) as BoxSend
+            })
+            .collect();
+        let mut joined = futures::future::join_all(sends);
+        assert!(
+            futures::FutureExt::now_or_never(&mut joined).is_none(),
+            "the gate is closed, so nothing can have completed"
+        );
+
+        transport.gate.add_permits(FRAMES);
+        for result in joined.await {
+            result.expect("send must succeed");
+        }
+
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let bodies: Vec<Vec<u8>> = transport
+            .writes()
+            .iter()
+            .flat_map(|w| split_frames(w))
+            .collect();
+        assert_eq!(bodies.len(), FRAMES, "every frame must reach the wire");
+        for (counter, mut body) in bodies.into_iter().enumerate() {
+            read_key
+                .decrypt_in_place_with_counter(counter as u32, &mut body)
+                .expect("a frame written out of counter order cannot authenticate");
+            // Decrypting alone would not catch a reorder: jobs that woke out of
+            // FIFO order would be encrypted in that order too, so their
+            // counters would still line up. The payload is what pins it -
+            // unlike the concurrent-producer test, these sends are polled in
+            // order by one joined future, so submission order is deterministic.
+            assert_eq!(
+                body,
+                vec![counter as u8; 32],
+                "frame {counter} must carry the payload submitted at position {counter}"
+            );
+        }
+    }
+
+    /// A single-frame send hands its caller the transport's own error, not a
+    /// wrapper. Callers with a custom `Transport` downcast to their own error
+    /// type to decide whether a failure is retryable, and `downcast_ref` looks
+    /// at the concrete type rather than walking the chain, so wrapping the
+    /// common case would silently break that.
+    #[tokio::test]
+    async fn a_lone_waiter_gets_the_transport_error_untouched() {
+        #[derive(Debug)]
+        struct TypedTransportError;
+        impl std::fmt::Display for TypedTransportError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "typed transport error")
+            }
+        }
+        impl std::error::Error for TypedTransportError {}
+
+        struct TypedFailTransport;
+
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl Transport for TypedFailTransport {
+            async fn send(&self, _data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+                Err(anyhow::Error::new(TypedTransportError))
+            }
+            async fn disconnect(&self) {}
+        }
+
+        let key = [0x77u8; 32];
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let socket = NoiseSocket::new(
+            runtime,
+            Arc::new(TypedFailTransport),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        );
+
+        let err = socket
+            .encrypt_and_send(bytes::Bytes::from(vec![9u8; 32]))
+            .await
+            .expect_err("the transport always fails");
+
+        assert!(matches!(err.kind, EncryptSendErrorKind::Transport));
+        assert!(
+            err.source.downcast_ref::<TypedTransportError>().is_some(),
+            "a lone waiter must receive the transport's own error type, got: {:?}",
+            err.source
+        );
     }
 
     /// The byte ceiling must hold across a burst. Checking it after appending

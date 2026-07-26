@@ -651,6 +651,28 @@ impl Client {
         let _ = tx.try_send((node, guard));
     }
 
+    /// Whether queued outbound work should be dropped rather than sent.
+    ///
+    /// This is the gate [`Self::send_ack_for`] applies before every ack, hoisted
+    /// so the burst path applies it too: during an expected teardown (an
+    /// intentional disconnect, or a 515) queued acks are deliberately dropped
+    /// rather than raced against the disconnect, and sending them anyway would
+    /// also hold the outbound flush open until its timeout.
+    pub(crate) fn outbound_teardown_in_progress(&self) -> bool {
+        self.expected_disconnect.load(Ordering::Relaxed) || !self.is_connected()
+    }
+
+    /// How many queued acks one burst may take.
+    ///
+    /// Measured, not guessed: the send-job channel holds 8, so a larger burst
+    /// fills it and makes unrelated producers (a reply, a receipt) wait for a
+    /// slot. At 16 the harness showed 29% fewer writes but 3.7% worse pong
+    /// latency (paired t = 2.8); at 4 the write saving is ~16% and latency is
+    /// no worse than main. Raising the channel instead recovers the latency but
+    /// gives back most of the coalescing, because a sender that never waits
+    /// consumes jobs one at a time.
+    const MAX_ACK_BURST: usize = 4;
+
     /// Worker shared by every deferred ack. Holds a `Weak`, so a dropped
     /// `Client` closes the channel and ends the task instead of keeping the
     /// client alive.
@@ -667,16 +689,104 @@ impl Client {
         let client = Arc::downgrade(self);
         self.runtime
             .spawn(Box::pin(async move {
-                while let Ok((node, guard)) = rx.recv().await {
+                // Reuse the bounded control buffers for the worker's lifetime.
+                // Encoded payload allocations still move into `Bytes`; only
+                // the outer storage stays here.
+                let mut batch = Vec::with_capacity(Self::MAX_ACK_BURST);
+                let mut frames = Vec::with_capacity(Self::MAX_ACK_BURST);
+                let mut guards = Vec::with_capacity(Self::MAX_ACK_BURST);
+                while let Ok(first) = rx.recv().await {
                     let Some(client) = client.upgrade() else {
                         break;
                     };
-                    if let Err(e) = client.send_ack_for(node.get()).await
-                        && !e.is_transport_unavailable()
+
+                    // Take everything already waiting, not just the one job that
+                    // woke us. Awaiting each ack before reading the next is what
+                    // kept the noise sender from ever seeing two frames at once,
+                    // so its batching only fired when some *other* producer
+                    // happened to interleave. `try_recv` only: this never waits
+                    // for work that has not arrived.
+                    batch.push(first);
+                    while batch.len() < Self::MAX_ACK_BURST
+                        && let Ok(next) = rx.try_recv()
                     {
-                        warn!("Failed to send ack: {e:?}");
+                        batch.push(next);
                     }
-                    drop(guard);
+
+                    // The queue is still drained, exactly as the
+                    // one-at-a-time worker did; only the send is skipped.
+                    if client.outbound_teardown_in_progress() {
+                        batch.clear();
+                        continue;
+                    }
+
+                    // Encoding is synchronous, so the whole burst is marshalled
+                    // before anything is sent and arrival order survives.
+                    for (node, guard) in batch.drain(..) {
+                        match client.encode_ack_from_snapshot(
+                            node.get(),
+                            AckParticipantPolicy::OmitReceiptDestinationDuplicate,
+                        ) {
+                            Ok(buf) => {
+                                frames.push(buf);
+                                guards.push(guard);
+                            }
+                            // Matches the single-ack path: log and drop this one
+                            // rather than failing the rest of the burst.
+                            Err(e) => warn!("Failed to encode ack: {e}"),
+                        }
+                    }
+                    if frames.is_empty() {
+                        continue;
+                    }
+
+                    // The per-ack `wa.conn.ack` span lived in `send_ack_for`,
+                    // which this path no longer calls; a burst reports itself
+                    // once, with its size, rather than N times. The result
+                    // inspection is inside the instrumented future, not after
+                    // it: a failure has to be recorded while the span is open,
+                    // the way `send_ack_for`'s `err(Debug)` used to. And
+                    // `instrument` rather than `entered()`, because an
+                    // EnteredSpan is not Send and cannot cross the await.
+                    let frame_count = frames.len();
+                    let send_and_report = async {
+                        match client.send_raw_bytes_burst(&mut frames).await {
+                            Ok(results) => {
+                                for result in results {
+                                    if let Err(e) = result
+                                        && !e.is_transport_unavailable()
+                                    {
+                                        warn!("Failed to send ack: {e:?}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if !matches!(e, ClientError::NotConnected) {
+                                    warn!("Failed to send ack burst: {e:?}");
+                                }
+                            }
+                        }
+                    };
+                    #[cfg(feature = "tracing")]
+                    {
+                        use tracing::Instrument;
+                        send_and_report
+                            .instrument(tracing::trace_span!(
+                                "wa.conn.ack_burst",
+                                frames = frame_count
+                            ))
+                            .await;
+                    }
+                    #[cfg(not(feature = "tracing"))]
+                    {
+                        let _ = frame_count;
+                        send_and_report.await;
+                    }
+                    debug_assert!(
+                        frames.is_empty(),
+                        "send_raw_bytes_burst must always drain its input"
+                    );
+                    guards.clear();
                 }
             }))
             .detach();
