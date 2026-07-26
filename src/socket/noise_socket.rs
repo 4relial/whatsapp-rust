@@ -10,8 +10,41 @@ use wacore::runtime::{AbortHandle, Runtime};
 
 const INLINE_ENCRYPT_THRESHOLD: usize = 16 * 1024;
 
+/// Ceilings on one batched write. They bound how much is buffered before the
+/// first frame reaches the socket; the batch never waits for work, so these
+/// only matter when a burst is already queued.
+const MAX_BATCH_FRAMES: usize = 16;
+const MAX_BATCH_WIRE_BYTES: usize = 64 * 1024;
+
 /// Result type for send operations.
 type SendResult = std::result::Result<(), EncryptSendError>;
+
+/// Wire size a plaintext will occupy once encrypted and framed: the AES-GCM tag
+/// plus the length prefix. Used to test a queued frame against the batch ceiling
+/// before paying to encrypt it.
+fn frame_wire_len(plaintext_len: usize) -> usize {
+    const TAG_LEN: usize = 16;
+    plaintext_len + TAG_LEN + wacore::framing::FRAME_LENGTH_SIZE
+}
+
+/// One batched write's failure, handed to every waiter in that batch.
+///
+/// `anyhow::Error` is not `Clone`, so a shared reference is what lets all the
+/// callers see the real cause instead of a re-worded copy.
+#[derive(Debug)]
+struct SharedSendFailure(Arc<EncryptSendError>);
+
+impl std::fmt::Display for SharedSendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SharedSendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(self.0.as_ref())
+    }
+}
 
 /// A job sent to the dedicated sender task.
 struct SendJob {
@@ -102,22 +135,108 @@ impl NoiseSocket {
         // in-band, so the whole sender goes out of service and the connection
         // must be re-established with a fresh handshake key.
         let mut poisoned = false;
+        // Reused across batches: one allocation for the life of the connection
+        // instead of one per batch.
+        let mut waiters: Vec<(oneshot::Sender<SendResult>, usize)> = Vec::new();
+        // A job pulled off the channel that would have overflowed the byte
+        // ceiling, held over to open the next batch. Dropping it (on shutdown)
+        // drops its response channel, which the caller sees as a closed sender:
+        // a held-over job can be lost, but it can never hang its caller.
+        let mut carry_over: Option<SendJob> = None;
 
-        while let Ok(job) = send_job_rx.recv().await {
-            let result = if poisoned {
-                Err(EncryptSendError::poisoned())
-            } else {
-                let outcome = Self::process_send_job(
+        loop {
+            let job = match carry_over.take() {
+                Some(job) => job,
+                None => match send_job_rx.recv().await {
+                    Ok(job) => job,
+                    Err(_) => break,
+                },
+            };
+            if poisoned {
+                let _ = job.response_tx.send(Err(EncryptSendError::poisoned()));
+                continue;
+            }
+
+            // Encrypt everything already queued into one buffer and write it
+            // once. Three independent producers answer a single inbound message
+            // (the reply, the delivery receipt and the stanza ack), so a write
+            // per frame turned into a syscall, a TLS record and a WebSocket
+            // message per frame. Only frames that are ALREADY waiting are taken:
+            // never block for more, or this trades syscalls for latency.
+            waiters.clear();
+            let mut encrypt_failure: Option<(oneshot::Sender<SendResult>, EncryptSendError)> = None;
+            let mut job = job;
+            loop {
+                let response_tx = job.response_tx;
+                match Self::encrypt_frame_into(
                     &runtime,
-                    &transport,
                     &write_key,
                     &mut write_counter,
                     job.plaintext,
                     &mut enc_buf,
                     &mut out_buf,
-                    stats.as_deref(),
                 )
-                .await;
+                .await
+                {
+                    Ok(wire_bytes) => waiters.push((response_tx, wire_bytes)),
+                    Err(e) => {
+                        // The counter is untouched on this frame, and every
+                        // frame already in the buffer must still go out so the
+                        // peer's counters stay contiguous.
+                        encrypt_failure = Some((response_tx, e));
+                        break;
+                    }
+                }
+                if out_buf.len() >= MAX_BATCH_WIRE_BYTES || waiters.len() >= MAX_BATCH_FRAMES {
+                    break;
+                }
+                match send_job_rx.try_recv() {
+                    Ok(next) => {
+                        // Check the ceiling before appending, not after, or a
+                        // nearly-full batch overshoots it by a whole frame. A
+                        // frame that cannot fit any batch still goes alone
+                        // rather than deadlocking against the ceiling.
+                        let projected = out_buf.len() + frame_wire_len(next.plaintext.len());
+                        if projected > MAX_BATCH_WIRE_BYTES {
+                            carry_over = Some(next);
+                            break;
+                        }
+                        job = next;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            let outcome = if out_buf.is_empty() {
+                Ok(())
+            } else {
+                // Zero-copy: split() hands the written bytes over and out_buf
+                // keeps its capacity for the next batch.
+                let wire = out_buf.split().freeze();
+                if waiters.len() > 1 {
+                    // The only externally visible sign that a batch happened.
+                    // Without it, "does the peer accept several frames in one
+                    // WebSocket message?" cannot be answered from a live run.
+                    log::debug!(
+                        "noise: coalesced {} frames into one {}-byte write",
+                        waiters.len(),
+                        wire.len()
+                    );
+                }
+                match transport.send(wire).await {
+                    Ok(()) => {
+                        if let Some(stats) = stats.as_deref() {
+                            for (_, wire_bytes) in &waiters {
+                                stats.record_frame_sent(*wire_bytes);
+                            }
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(EncryptSendError::transport(e)),
+                }
+            };
+
+            {
                 // Crypto and framing failures are rejected before any byte
                 // reaches the wire and leave the counter untouched, so they do
                 // not compromise the keystream. Only a transport failure is
@@ -137,33 +256,55 @@ impl NoiseSocket {
                     // the only way this sender becomes usable again.
                     transport.disconnect().await;
                 }
-                outcome
-            };
+            }
 
-            let _ = job.response_tx.send(result);
+            // Every frame in this batch shares the fate of the single write.
+            // EncryptSendError carries an anyhow::Error and is not Clone, and
+            // its Display renders only the kind, so flattening the failure to a
+            // string would hand every caller "transport error" with the actual
+            // cause discarded. Sharing one Arc keeps the whole chain intact for
+            // all of them at the cost of a refcount bump each.
+            let failure = match outcome {
+                Ok(()) => None,
+                Err(err) => Some(Arc::new(err)),
+            };
+            for (response_tx, _) in waiters.drain(..) {
+                let result = match &failure {
+                    None => Ok(()),
+                    Some(err) => Err(EncryptSendError::transport(SharedSendFailure(err.clone()))),
+                };
+                let _ = response_tx.send(result);
+            }
+            if let Some((response_tx, err)) = encrypt_failure {
+                let _ = response_tx.send(Err(err));
+            }
         }
     }
 
-    /// Process a single send job: encrypt and send the message.
-    #[allow(clippy::too_many_arguments)]
-    async fn process_send_job(
+    /// Encrypt one plaintext and append the framed result to `out_buf`,
+    /// returning its wire size. The counter is burned once the framed ciphertext
+    /// is committed to `out_buf`, whether or not the write that carries it
+    /// succeeds. Every error path returns before writing a byte into `out_buf`,
+    /// which is the only reason leaving the counter unburned there is sound: a
+    /// change that keeps partial output must burn the counter too, or the next
+    /// frame reuses its nonce.
+    async fn encrypt_frame_into(
         runtime: &Arc<dyn Runtime>,
-        transport: &Arc<dyn Transport>,
         write_key: &Arc<NoiseCipher>,
         write_counter: &mut u32,
         plaintext: bytes::Bytes,
         enc_buf: &mut Vec<u8>,
         out_buf: &mut BytesMut,
-        stats: Option<&wacore::stats::SessionStats>,
-    ) -> SendResult {
+    ) -> std::result::Result<usize, EncryptSendError> {
         let counter = *write_counter;
-        // Refuse to wrap the per-direction frame counter: reusing an AES-GCM nonce
-        // under the same key is catastrophic. Mirrors NoiseState::post_increment_counter
-        // (which errors on exhaustion). 2^32 frames per connection is unreachable in
-        // practice, so erroring here forces a reconnect rather than a silent nonce reuse.
+        // Refuse to wrap the per-direction frame counter: reusing an AES-GCM
+        // nonce under the same key is catastrophic. 2^32 frames per connection
+        // is unreachable in practice, so erroring here forces a reconnect
+        // rather than a silent nonce reuse.
         if counter == u32::MAX {
             return Err(EncryptSendError::crypto(NoiseError::CounterExhausted));
         }
+        let before = out_buf.len();
 
         if plaintext.len() <= INLINE_ENCRYPT_THRESHOLD {
             enc_buf.clear();
@@ -171,50 +312,28 @@ impl NoiseSocket {
             if let Err(e) = write_key.encrypt_in_place_with_counter(counter, enc_buf) {
                 return Err(EncryptSendError::crypto(e));
             }
-
-            if let Err(e) = wacore::framing::encode_frame_into(enc_buf, None, out_buf) {
+            if let Err(e) = wacore::framing::append_frame_into(enc_buf, None, out_buf) {
                 return Err(EncryptSendError::framing(e));
             }
         } else {
             let write_key = write_key.clone();
-            // `Bytes` is Send + 'static: move it into the blocking task (a refcount
-            // bump) instead of copying the whole >16KB plaintext with `to_vec()`.
+            // `Bytes` is Send + 'static: move it into the blocking task (a
+            // refcount bump) instead of copying the whole >16KB plaintext.
             let encrypt_result = wacore::runtime::blocking(&**runtime, move || {
                 write_key.encrypt_with_counter(counter, &plaintext)
             })
             .await;
-
             let ciphertext = match encrypt_result {
                 Ok(c) => c,
-                Err(e) => {
-                    return Err(EncryptSendError::crypto(e));
-                }
+                Err(e) => return Err(EncryptSendError::crypto(e)),
             };
-
-            if let Err(e) = wacore::framing::encode_frame_into(&ciphertext, None, out_buf) {
+            if let Err(e) = wacore::framing::append_frame_into(&ciphertext, None, out_buf) {
                 return Err(EncryptSendError::framing(e));
             }
         }
 
-        // Zero-copy: split() moves the written data into a new BytesMut,
-        // freeze() converts it to Bytes. The original out_buf retains its
-        // allocated capacity for the next frame.
-        let frame = out_buf.split().freeze();
-        let wire_bytes = frame.len();
-        // Burn the counter at the moment the nonce leaves this function, not
-        // when the write is confirmed: a `transport.send` that returns Err may
-        // still have put those bytes on the wire, and a second frame derived
-        // from the same counter would reuse the AES-GCM nonce. The counter is
-        // known to be below u32::MAX from the guard above, so `+ 1` is exact.
         *write_counter = counter + 1;
-        if let Err(e) = transport.send(frame).await {
-            return Err(EncryptSendError::transport(e));
-        }
-        if let Some(stats) = stats {
-            stats.record_frame_sent(wire_bytes);
-        }
-
-        Ok(())
+        Ok(out_buf.len() - before)
     }
 
     pub async fn encrypt_and_send(&self, plaintext: bytes::Bytes) -> SendResult {
@@ -261,6 +380,7 @@ impl NoiseSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use wacore::framing::FRAME_LENGTH_SIZE;
 
@@ -511,15 +631,13 @@ mod tests {
         );
     }
 
-    /// Drives the per-frame primitive directly against an always-failing
-    /// transport: even without the sender-task poison flag, a counter value is
-    /// never handed to the cipher twice. Proven by decrypting the two captured
-    /// frames with counters 0 and 1 - reuse would make the second decrypt fail.
+    /// Drives the per-frame primitive directly: every frame burns exactly one
+    /// counter at encrypt time, whether or not the write that carries it ever
+    /// succeeds. Proven by decrypting the two frames with counters 0 and 1 -
+    /// reuse would make the second decrypt fail.
     #[tokio::test]
-    async fn write_counter_is_never_reused_after_a_send_error() {
+    async fn every_encrypted_frame_burns_its_own_counter() {
         let key = [0x33u8; 32];
-        let transport: Arc<AcceptThenFailTransport> = Arc::new(AcceptThenFailTransport::new(0));
-        let transport_dyn: Arc<dyn Transport> = transport.clone();
         let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
         let write_key = Arc::new(NoiseCipher::new(&key).expect("32-byte key"));
 
@@ -529,34 +647,253 @@ mod tests {
 
         for expected_counter in 0..2u32 {
             assert_eq!(write_counter, expected_counter);
-            let err = NoiseSocket::process_send_job(
+            NoiseSocket::encrypt_frame_into(
                 &runtime,
-                &transport_dyn,
                 &write_key,
                 &mut write_counter,
                 bytes::Bytes::from(vec![expected_counter as u8; 32]),
                 &mut enc_buf,
                 &mut out_buf,
-                None,
             )
             .await
-            .expect_err("transport always fails");
-            assert!(matches!(err.kind, EncryptSendErrorKind::Transport));
+            .expect("encrypt must succeed");
             assert_eq!(
                 write_counter,
                 expected_counter + 1,
-                "a failed send must still consume its counter"
+                "each frame must consume its counter at encrypt time"
             );
         }
 
         let read_key = NoiseCipher::new(&key).expect("32-byte key");
-        for (counter, frame) in transport.sent().into_iter().enumerate() {
-            let mut body = frame[FRAME_LENGTH_SIZE..].to_vec();
+        for (counter, frame) in split_frames(&out_buf).into_iter().enumerate() {
+            let mut body = frame;
             read_key
                 .decrypt_in_place_with_counter(counter as u32, &mut body)
                 .expect("each frame must decrypt under its own distinct counter");
             assert_eq!(body, vec![counter as u8; 32]);
         }
+    }
+
+    /// The byte ceiling must hold across a burst. Checking it after appending
+    /// would let a nearly-full batch overshoot by a whole frame, which for a
+    /// large stanza is the difference between a bounded buffer and an unbounded
+    /// one.
+    #[tokio::test]
+    async fn a_batch_never_overshoots_the_byte_ceiling() {
+        let key = [0x66u8; 32];
+        let transport = GatedTransport::closed();
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let socket = Arc::new(NoiseSocket::new(
+            runtime,
+            transport.clone(),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        ));
+
+        // Sized so three fit under the ceiling and the fourth cannot: the batch
+        // has to stop and hold it over rather than append it.
+        const FRAME_BYTES: usize = 20 * 1024;
+        const FRAMES: usize = 5;
+        let mut sends = queue_all(
+            &socket,
+            (0..FRAMES).map(|i| bytes::Bytes::from(vec![i as u8; FRAME_BYTES])),
+        );
+        transport.gate.add_permits(FRAMES);
+        for result in (&mut sends).await {
+            result.expect("send must succeed");
+        }
+
+        let writes = transport.writes();
+        for write in &writes {
+            let frames = split_frames(write);
+            assert!(
+                frames.len() == 1 || write.len() <= MAX_BATCH_WIRE_BYTES,
+                "a multi-frame write must respect the ceiling: {} bytes in {} frames",
+                write.len(),
+                frames.len()
+            );
+        }
+        assert!(
+            writes.iter().any(|w| split_frames(w).len() > 1),
+            "the burst must still coalesce, otherwise this proves nothing"
+        );
+
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let bodies: Vec<Vec<u8>> = writes.iter().flat_map(|w| split_frames(w)).collect();
+        assert_eq!(bodies.len(), FRAMES, "a held-over frame must still be sent");
+        for (counter, mut body) in bodies.into_iter().enumerate() {
+            read_key
+                .decrypt_in_place_with_counter(counter as u32, &mut body)
+                .expect("holding a frame over must not disturb counter order");
+        }
+    }
+
+    /// The transport's own error must survive the hop to every caller. It cannot
+    /// be cloned, and `EncryptSendError`'s Display renders only the kind, so a
+    /// naive rebuild silently degrades "connection reset by peer" into
+    /// "transport error" and the caller loses the only diagnostic there was.
+    #[tokio::test]
+    async fn the_transport_cause_reaches_the_caller() {
+        let key = [0x55u8; 32];
+        let transport: Arc<AcceptThenFailTransport> = Arc::new(AcceptThenFailTransport::new(0));
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let socket = NoiseSocket::new(
+            runtime,
+            transport,
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        );
+
+        let err = socket
+            .encrypt_and_send(bytes::Bytes::from(vec![7u8; 32]))
+            .await
+            .expect_err("the transport always fails");
+
+        assert!(matches!(err.kind, EncryptSendErrorKind::Transport));
+        // `{:#}` walks the anyhow chain; the injected message must still be in it.
+        let chain = format!("{:#}", err.source);
+        assert!(
+            chain.contains("injected failure after accepting the frame"),
+            "the transport's cause was lost on the way to the caller: {chain}"
+        );
+    }
+
+    /// A transport whose writes block until permits are handed out, so a test
+    /// can pile jobs into the sender's channel and then release them: the state
+    /// batching exists for.
+    struct GatedTransport {
+        writes: std::sync::Mutex<Vec<bytes::Bytes>>,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl GatedTransport {
+        fn closed() -> Arc<Self> {
+            Arc::new(Self {
+                writes: std::sync::Mutex::new(Vec::new()),
+                gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn writes(&self) -> Vec<bytes::Bytes> {
+            self.writes.lock().expect("writes mutex").clone()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl Transport for GatedTransport {
+        async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            let permit = self.gate.acquire().await.expect("gate open");
+            permit.forget();
+            self.writes.lock().expect("writes mutex").push(data);
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+    }
+
+    /// Queues every payload on `socket` and returns the joined sends, still
+    /// pending.
+    ///
+    /// This is the batching tests' precondition: all N frames sitting in the
+    /// sender's channel at once. It holds by construction rather than by
+    /// waiting - `send` on a channel with room resolves on its first poll, so
+    /// polling the joined future once has queued every job - which is why these
+    /// tests do not spin on `yield_now` and hope the scheduler cooperated.
+    fn queue_all(
+        socket: &Arc<NoiseSocket>,
+        payloads: impl Iterator<Item = bytes::Bytes>,
+    ) -> futures::future::JoinAll<BoxSend> {
+        let sends: Vec<BoxSend> = payloads
+            .map(|payload| {
+                let socket = socket.clone();
+                Box::pin(async move { socket.encrypt_and_send(payload).await }) as BoxSend
+            })
+            .collect();
+        let mut joined = futures::future::join_all(sends);
+        let queued = futures::FutureExt::now_or_never(&mut joined);
+        assert!(
+            queued.is_none(),
+            "the sends must still be in flight: the transport gate is closed"
+        );
+        joined
+    }
+
+    type BoxSend = std::pin::Pin<Box<dyn Future<Output = SendResult> + Send>>;
+
+    /// Splits a concatenated run of length-prefixed frames into their bodies.
+    fn split_frames(mut wire: &[u8]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while !wire.is_empty() {
+            let mut len = 0usize;
+            for byte in &wire[..FRAME_LENGTH_SIZE] {
+                len = (len << 8) | *byte as usize;
+            }
+            let body = &wire[FRAME_LENGTH_SIZE..FRAME_LENGTH_SIZE + len];
+            frames.push(body.to_vec());
+            wire = &wire[FRAME_LENGTH_SIZE + len..];
+        }
+        frames
+    }
+
+    /// Frames queued while a write is in flight leave together in one write, in
+    /// counter order, and every caller is answered. Batching is only sound if
+    /// all three hold: a lost waiter hangs a send forever, and reordering would
+    /// desync the peer's read counter.
+    #[tokio::test]
+    async fn queued_frames_leave_in_one_write_in_counter_order() {
+        let key = [0x44u8; 32];
+        let transport = GatedTransport::closed();
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+        let socket = Arc::new(NoiseSocket::new(
+            runtime,
+            transport.clone(),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        ));
+
+        const FRAMES: usize = 5;
+        let mut sends = queue_all(
+            &socket,
+            (0..FRAMES).map(|i| bytes::Bytes::from(vec![i as u8; 32])),
+        );
+        transport.gate.add_permits(FRAMES);
+        for result in (&mut sends).await {
+            result.expect("send must succeed");
+        }
+
+        let writes = transport.writes();
+        assert!(
+            writes.len() < FRAMES,
+            "queued frames must coalesce, got {} writes for {FRAMES} frames",
+            writes.len()
+        );
+
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let bodies: Vec<Vec<u8>> = writes.iter().flat_map(|w| split_frames(w)).collect();
+        assert_eq!(bodies.len(), FRAMES, "every frame must reach the wire");
+
+        // Decrypting frame N under counter N is the order proof: the counter is
+        // the AES-GCM nonce, so a frame written out of order fails to
+        // authenticate here.
+        let mut payloads = Vec::new();
+        for (counter, body) in bodies.into_iter().enumerate() {
+            let mut body = body;
+            read_key
+                .decrypt_in_place_with_counter(counter as u32, &mut body)
+                .expect("frames must be written in counter order");
+            assert_eq!(body, vec![body[0]; 32], "frame body must survive intact");
+            payloads.push(body[0]);
+        }
+
+        // Which producer wins which counter is not fixed - the senders race into
+        // the channel - so the invariant is that each one's payload is on the
+        // wire exactly once, none dropped and none duplicated.
+        payloads.sort_unstable();
+        let expected: Vec<u8> = (0..FRAMES as u8).collect();
+        assert_eq!(
+            payloads, expected,
+            "each producer's payload must appear exactly once"
+        );
     }
 
     /// A framing failure is detected before any byte reaches the wire, so it
@@ -600,19 +937,19 @@ mod tests {
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl Transport for RecordingTransport {
             async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
-                if data.len() > 16 {
-                    let mut data = data.to_vec();
-                    // Strip the 3-byte frame header, then decrypt in place
-                    data.drain(..3);
+                // One write can carry several frames: the sender coalesces
+                // whatever is already queued, so each write is unpacked frame by
+                // frame before decrypting.
+                for mut frame in split_frames(&data) {
                     let counter = self.counter.fetch_add(1, Ordering::SeqCst);
 
                     if self
                         .read_key
-                        .decrypt_in_place_with_counter(counter, &mut data)
+                        .decrypt_in_place_with_counter(counter, &mut frame)
                         .is_ok()
-                        && !data.is_empty()
+                        && !frame.is_empty()
                     {
-                        let index = data[0];
+                        let index = frame[0];
                         let mut order = self.recorded_order.lock().await;
                         order.push(index);
                     }
