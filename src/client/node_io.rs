@@ -188,10 +188,13 @@ impl Client {
                                 self.stats.mark_recv_activity();
                                 let wire_bytes = data.len();
 
-                                // Feed data into the frame decoder. The payload is
-                                // adopted zero-copy when it is the sole reference
-                                // and no partial frame is pending (steady state).
-                                frame_decoder.feed_bytes(data);
+                                // Dropped before any await below: the payload is
+                                // a view into the websocket's shared read buffer,
+                                // so holding it while a node is processed keeps
+                                // that allocation alive alongside the decoder's
+                                // copy of the same bytes.
+                                frame_decoder.feed(&data);
+                                drop(data);
 
                                 // Process all complete frames.
                                 // Frame decryption must be sequential (noise protocol counter),
