@@ -692,6 +692,35 @@ impl SignalStoreCache {
 
     // === Sessions (object cache — serialize only during flush) ===
 
+    /// Decode a stored session, quarantining a blob this build cannot read.
+    ///
+    /// Deserialization is a pure function of the bytes, so a row that fails
+    /// once fails identically forever — and it fails on *every* path that must
+    /// load the address, including the decrypt of the peer's next pre-key
+    /// message and the retry repair, which are precisely the paths that would
+    /// otherwise replace it. Propagating the error therefore strands the
+    /// address until an operator deletes the row by hand. Reporting it as
+    /// absent instead lets the ordinary no-session recovery fetch a pre-key
+    /// bundle and overwrite it. Nothing is lost: a record we cannot decode can
+    /// derive no key material, so it cannot repeat a counter either.
+    fn decode_stored_session(
+        key: &str,
+        bytes: &[u8],
+        incarnation: &StoreIncarnation,
+    ) -> Option<SessionRecord> {
+        match SessionRecord::deserialize_for_store(bytes, incarnation) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                log::error!(
+                    "discarding unreadable session row for addr#{:016x}: {error} — recovering with a fresh session",
+                    wacore_binary::jid::observe_token(key)
+                );
+                crate::telemetry::session_record_quarantined();
+                None
+            }
+        }
+    }
+
     /// Takes ownership of the cached session, leaving a `CheckedOut` marker.
     /// Callers must return the record with [`put_session`](Self::put_session) after use.
     pub async fn get_session(
@@ -738,9 +767,11 @@ impl SignalStoreCache {
             CachedSessionCheckout::Busy => anyhow::bail!("session is already checked out"),
             CachedSessionCheckout::Missing(checkout) => checkout,
         };
-        match backend_result {
-            Some(bytes) => {
-                let record = SessionRecord::deserialize_for_store(&bytes, &state.incarnation)?;
+        match backend_result
+            .as_deref()
+            .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
+        {
+            Some(record) => {
                 state.cache.insert(
                     Arc::from(key),
                     SessionEntry::CheckedOut {
@@ -808,12 +839,12 @@ impl SignalStoreCache {
                 SessionEntry::Absent | SessionEntry::CheckedOut { .. } => Ok(None),
             };
         }
-        match backend_result {
-            Some(bytes) => {
-                let record = Arc::new(SessionRecord::deserialize_for_store(
-                    &bytes,
-                    &state.incarnation,
-                )?);
+        match backend_result
+            .as_deref()
+            .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
+        {
+            Some(record) => {
+                let record = Arc::new(record);
                 state
                     .cache
                     .insert(Arc::from(key), SessionEntry::Present(record.clone()));
@@ -870,8 +901,15 @@ impl SignalStoreCache {
     }
 
     /// Non-destructive existence check; an empty checkout remains absent.
-    /// Backend misses are negative-cached; hits are not cached to skip
-    /// deserialization (the subsequent `get_session` will cache on demand).
+    ///
+    /// A cold probe reads and decodes the row rather than asking the backend
+    /// whether it exists. Row existence alone would report a quarantined
+    /// session as present, and this is the probe that decides whether a send
+    /// fetches a pre-key bundle: answering `true` for a row that
+    /// [`Self::checkout_session`] will then discard skips the recovery, and the
+    /// send fails or silently drops that recipient from the fan-out. The decode
+    /// is not wasted work either, since the record it produces is cached for
+    /// the checkout that follows.
     pub async fn has_session(
         &self,
         address: &ProtocolAddress,
@@ -885,15 +923,21 @@ impl SignalStoreCache {
             }
         }
         // Backend I/O outside the lock
-        let exists = backend.has_session(key).await?;
+        let backend_result = backend.get_session(key).await?;
         let mut state = self.lock_sessions().await;
         if let Some(entry) = state.cache.get(key) {
             return Ok(entry.exists());
         }
-        if !exists {
-            state.cache.insert(Arc::from(key), SessionEntry::Absent);
-            state.evict_if_needed(self.max_entries);
-        }
+        let entry = match backend_result
+            .as_deref()
+            .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
+        {
+            Some(record) => SessionEntry::Present(Arc::new(record)),
+            None => SessionEntry::Absent,
+        };
+        let exists = entry.exists();
+        state.cache.insert(Arc::from(key), entry);
+        state.evict_if_needed(self.max_entries);
         Ok(exists)
     }
 
@@ -1232,7 +1276,26 @@ impl SignalStoreCache {
                         };
                         let durable = match durable {
                             Some(d) => d,
-                            None => backend.has_session(addr.as_ref()).await?,
+                            // Row existence is not enough: a row that does not
+                            // decode is no session at all, and deleting the
+                            // prekey against it is the very outcome this block
+                            // exists to prevent -- a redelivered pkmsg would
+                            // have neither a usable session nor the prekey to
+                            // rebuild one. Decoded under the sessions lock we
+                            // already hold, so the decision stays atomic
+                            // against a decrypt storing its own session.
+                            None => backend
+                                .get_session(addr.as_ref())
+                                .await?
+                                .as_deref()
+                                .and_then(|bytes| {
+                                    Self::decode_stored_session(
+                                        addr.as_ref(),
+                                        bytes,
+                                        &state.incarnation,
+                                    )
+                                })
+                                .is_some(),
                         };
                         if durable {
                             deletable.push(*id);
@@ -2280,6 +2343,47 @@ mod consumed_prekey_atomicity_tests {
         );
     }
 
+    /// The same, for a row that is present but does not decode. Row existence
+    /// alone would call it durable and delete the prekey, leaving a redelivered
+    /// pkmsg with neither a usable session nor the prekey to rebuild one --
+    /// which is the exact outcome the deferral rule exists to prevent.
+    #[tokio::test]
+    async fn prekey_behind_an_unreadable_session_row_survives_flush() {
+        use super::lease_reload_tests::leased_session;
+        use crate::libsignal::protocol::consts::MAX_RESERVATION_FAST_FORWARD;
+
+        let backend = InMemoryBackend::new();
+        let addr = seed(&backend).await;
+
+        // Persist a row that only fails to decode after a restart, so the
+        // backend genuinely holds bytes for this address.
+        let writer = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let mut stranded = leased_session();
+        stranded.reserve_sender_chain_counters(MAX_RESERVATION_FAST_FORWARD);
+        writer.put_session(&addr, stranded).await;
+        writer.flush(&backend).await.unwrap();
+        assert!(
+            backend.get_session(addr.as_str()).await.unwrap().is_some(),
+            "the row is there; what follows is about whether it decodes"
+        );
+
+        // A different incarnation: the reload has to fast-forward, and refuses.
+        let restarted = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xB2; 16],
+        );
+        restarted.remove_prekey(PREKEY_ID, addr.as_str()).await;
+        restarted.flush(&backend).await.unwrap();
+
+        assert!(
+            backend.load_prekey(PREKEY_ID).await.unwrap().is_some(),
+            "a prekey behind a row that does not decode must survive the flush"
+        );
+    }
+
     /// A prekey buffered for a session that is not durable (its volatile session
     /// was dropped before the buffer insert landed, e.g. a disconnect clear()
     /// racing the consume path) must NOT be deleted: removing the durable prekey
@@ -2958,7 +3062,7 @@ mod lease_reload_tests {
         SenderKeyName::from_parts("group@g.us", "15550001000@s.whatsapp.net:0")
     }
 
-    fn leased_session() -> SessionRecord {
+    pub(super) fn leased_session() -> SessionRecord {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
         let remote = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
@@ -3044,6 +3148,111 @@ mod lease_reload_tests {
         assert_eq!(
             session_chain_index(&recovered),
             crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH
+        );
+    }
+
+    /// A row whose lease is stranded above its chain (issue #1146: written by
+    /// a build that let a DH ratchet retire the chain without rebasing the
+    /// ceiling) cannot be fast-forwarded on recovery. It must not become a
+    /// hard error on every load: that strands the address, because the very
+    /// paths that would replace the session — the peer's next pre-key message
+    /// and the retry repair — have to load it first. Report it absent so the
+    /// no-session recovery replaces it.
+    #[tokio::test]
+    async fn an_unreadable_session_row_is_reported_absent_so_recovery_can_replace_it() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let address = ProtocolAddress::new("15550001009", 1.into());
+
+        let mut stranded = leased_session();
+        stranded.reserve_sender_chain_counters(
+            crate::libsignal::protocol::consts::MAX_RESERVATION_FAST_FORWARD,
+        );
+        assert_eq!(session_chain_index(&stranded), 0);
+        cache.put_session(&address, stranded).await;
+        cache.flush(&backend).await.expect("flush");
+
+        // A live reload never fast-forwards, so the row still looks fine here.
+        cache.clear_after_flush().await;
+        assert!(
+            cache
+                .get_session(&address, &backend)
+                .await
+                .expect("live reload")
+                .is_some()
+        );
+
+        // A restart (or lossy reset) is where recovery has to fast-forward.
+        let restarted = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xB2; 16],
+        );
+        assert!(
+            restarted
+                .get_session(&address, &backend)
+                .await
+                .expect("an unreadable row must not fail the load")
+                .is_none()
+        );
+        assert!(
+            !restarted
+                .has_session(&address, &backend)
+                .await
+                .expect("has_session"),
+            "the quarantined address must look session-less so ensure_e2e_sessions rebuilds it"
+        );
+    }
+
+    /// The existence probe on a cold cache is what decides whether a send
+    /// fetches a pre-key bundle, and it runs before anything loads the record.
+    /// Asking the backend whether the row exists answers `true` for a row the
+    /// very next checkout will discard, so the recovery is skipped and the send
+    /// either fails or drops that recipient from the fan-out.
+    ///
+    /// Distinct from the test above, which reaches `has_session` only after a
+    /// `get_session` has already negative-cached the address: that one passes
+    /// against the backend-existence probe too.
+    #[tokio::test]
+    async fn a_cold_existence_probe_does_not_report_a_quarantined_row_as_present() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let address = ProtocolAddress::new("15550001010", 1.into());
+
+        let mut stranded = leased_session();
+        stranded.reserve_sender_chain_counters(
+            crate::libsignal::protocol::consts::MAX_RESERVATION_FAST_FORWARD,
+        );
+        cache.put_session(&address, stranded).await;
+        cache.flush(&backend).await.expect("flush");
+
+        // Nothing has touched this address in this incarnation: the probe is
+        // the first thing to reach the row, exactly as it is on a real restart.
+        let restarted = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xB2; 16],
+        );
+        assert!(
+            !restarted
+                .has_session(&address, &backend)
+                .await
+                .expect("a quarantined row must not fail the probe"),
+            "a row the next checkout would discard must not be reported present"
+        );
+
+        // And the negative answer is cached, so the send that follows keeps
+        // seeing it session-less rather than re-reading the same row.
+        assert!(
+            restarted
+                .get_session(&address, &backend)
+                .await
+                .expect("checkout")
+                .is_none()
         );
     }
 
