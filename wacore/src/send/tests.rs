@@ -423,6 +423,8 @@ struct MockSendContextResolver {
     identity_changes: std::sync::Mutex<Vec<Jid>>,
     chain_lock_probe: Option<ChainLockProbe>,
     prekey_error_code: Option<u16>,
+    /// Devices the server names as rejected inside an otherwise fine response.
+    rejected_devices: Vec<crate::prekeys::RejectedDevice>,
 }
 
 impl MockSendContextResolver {
@@ -434,6 +436,7 @@ impl MockSendContextResolver {
             identity_changes: std::sync::Mutex::new(Vec::new()),
             chain_lock_probe: None,
             prekey_error_code: None,
+            rejected_devices: Vec::new(),
         }
     }
 
@@ -466,6 +469,14 @@ impl MockSendContextResolver {
         self
     }
 
+    /// The server answers with bundles for the rest of the batch and an
+    /// `<error>` for `jid`, which is how it names one absent device.
+    fn with_rejected_device(mut self, jid: Jid, code: u16) -> Self {
+        self.rejected_devices
+            .push(crate::prekeys::RejectedDevice { jid, code });
+        self
+    }
+
     fn with_prekey_error(mut self, code: u16) -> Self {
         self.prekey_error_code = Some(code);
         self
@@ -493,7 +504,7 @@ impl SendContextResolver for MockSendContextResolver {
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<HashMap<Jid, PreKeyBundle>> {
+    ) -> Result<crate::prekeys::PreKeyFetchOutcome> {
         if let Some(code) = self.prekey_error_code {
             return Err(anyhow::Error::new(crate::request::ServerErrorCode {
                 code,
@@ -527,7 +538,10 @@ impl SendContextResolver for MockSendContextResolver {
             }
             // If None, we intentionally omit it from the result (simulating server not returning it)
         }
-        Ok(result)
+        Ok(crate::prekeys::PreKeyFetchOutcome {
+            bundles: result,
+            rejected: self.rejected_devices.clone(),
+        })
     }
 
     async fn resolve_group_info(&self, _jid: &Jid) -> Result<std::sync::Arc<GroupInfo>> {
@@ -2971,6 +2985,101 @@ mod collect_stale_device_users {
         info
     }
 
+    /// The case that separates a named rejection from an inferred one: one
+    /// device is rejected by name while another simply produced no bundle (an
+    /// absent or malformed one, or a session setup that failed). Only the named
+    /// device's user may be refreshed -- deleting the other user's device
+    /// registry would force a re-resolution over a failure that says nothing
+    /// about the list being stale.
+    #[test]
+    fn only_the_named_device_is_refreshed_when_the_server_named_it() {
+        use super::super::stale_users_for;
+
+        let info = group_info_lid(&[]);
+        let delivered = lid_device("100000000000001", 1);
+        let named = lid_device("100000000000002", 2);
+        let merely_missing = lid_device("100000000000003", 3);
+        let dist = vec![delivered.clone(), named.clone(), merely_missing.clone()];
+
+        let out = stale_users_for(true, &[named], Some(&dist), &[delivered], &info);
+        let set: HashSet<String> = out.into_iter().collect();
+
+        assert!(set.contains("100000000000002"), "the named device's user");
+        assert!(
+            !set.contains("100000000000003"),
+            "a device that merely produced no bundle is not evidence of a stale list"
+        );
+        assert_eq!(set.len(), 1);
+    }
+
+    /// A batch-wide failure names nobody, so the unencrypted remainder is the
+    /// only signal left -- and every target in it is suspect, because none of
+    /// them got a bundle either.
+    #[test]
+    fn a_batch_wide_failure_falls_back_to_the_unencrypted_remainder() {
+        use super::super::stale_users_for;
+
+        let info = group_info_lid(&[]);
+        let delivered = lid_device("100000000000001", 1);
+        let missing = lid_device("100000000000002", 2);
+        let dist = vec![delivered.clone(), missing];
+
+        let out = stale_users_for(true, &[], Some(&dist), &[delivered], &info);
+        let set: HashSet<String> = out.into_iter().collect();
+
+        assert!(set.contains("100000000000002"));
+        assert_eq!(set.len(), 1);
+    }
+
+    /// No unregistered device at all means nothing to refresh, whatever else
+    /// went unencrypted.
+    #[test]
+    fn nothing_is_refreshed_without_an_unregistered_device() {
+        use super::super::stale_users_for;
+
+        let info = group_info_lid(&[]);
+        let dist = vec![lid_device("100000000000001", 1)];
+
+        assert!(stale_users_for(false, &[], Some(&dist), &[], &info).is_empty());
+    }
+
+    /// Closes the loop the named rejection opens: the rejected device gets no
+    /// bundle, so it is never in the encrypted set, so it surfaces here as a
+    /// user to re-resolve. This is the recovery — not the sender-key marking,
+    /// which deliberately covers the whole target set (WA Web
+    /// `markHasSenderKey(x, skDistribList)`).
+    #[test]
+    fn a_device_that_was_never_encrypted_for_is_reported_stale() {
+        let info = group_info_lid(&[]);
+        let delivered = lid_device("100000000000001", 1);
+        let rejected = lid_device("100000000000002", 9);
+        let dist = vec![delivered.clone(), rejected.clone()];
+
+        let out = collect_stale_device_users(Some(&dist), &[delivered], &info);
+        let set: HashSet<String> = out.into_iter().collect();
+
+        assert!(
+            set.contains("100000000000002"),
+            "the device with no bundle must come back as stale"
+        );
+        assert!(
+            !set.contains("100000000000001"),
+            "a device that did receive the SKDM is not stale"
+        );
+    }
+
+    /// The counterpart: when every target was encrypted for, nothing is stale,
+    /// so an ordinary group send does not invalidate any device list.
+    #[test]
+    fn a_fully_delivered_distribution_reports_nothing_stale() {
+        let info = group_info_lid(&[]);
+        let a = lid_device("100000000000001", 1);
+        let b = lid_device("100000000000002", 2);
+        let dist = vec![a.clone(), b.clone()];
+
+        assert!(collect_stale_device_users(Some(&dist), &[a, b], &info).is_empty());
+    }
+
     #[test]
     fn emits_lid_and_pn_alias_when_mapping_known() {
         let info = group_info_lid(&[("100000000000001", "15550000001")]);
@@ -4507,6 +4616,116 @@ mod local_identity_change_on_send {
                 vec![good.to_string()],
                 "only the device that could encrypt is in the participant list"
             );
+        }
+
+        /// The server names one device inside an otherwise fine response, and
+        /// that naming has to survive the resolver boundary: the fan-out sets
+        /// the same stale-device flag a batch-wide 406 would, so the group path
+        /// still refreshes the list after the send. Flattening the rejection
+        /// into "no bundle" loses it, and the stale device is kept forever.
+        #[tokio::test]
+        async fn a_named_rejection_reaches_the_fan_out_like_a_batch_failure() {
+            let warm: Jid = "5511900000061:0@s.whatsapp.net".parse().unwrap();
+            let gone: Jid = "5511900000061:9@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+
+            // Not `with_prekey_error`: the batch succeeds, and the server names
+            // the one device it will not hand a bundle for.
+            let resolver = MockSendContextResolver::new().with_rejected_device(gone.clone(), 406);
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[warm.clone(), gone.clone()],
+            )
+            .await
+            .expect("a named rejection must not fail the fan-out");
+
+            assert!(
+                plan.had_unregistered_device,
+                "the named device must raise the same flag a batch 406 raises"
+            );
+        }
+
+        /// Only a `406` means "this device is gone". Another refusal code says
+        /// something else, and refreshing a device list over it costs a usync
+        /// for nothing.
+        #[tokio::test]
+        async fn a_rejection_that_is_not_a_406_leaves_the_device_list_alone() {
+            let warm: Jid = "5511900000071:0@s.whatsapp.net".parse().unwrap();
+            let odd: Jid = "5511900000071:9@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+            let resolver = MockSendContextResolver::new().with_rejected_device(odd.clone(), 503);
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[warm.clone(), odd.clone()],
+            )
+            .await
+            .expect("a non-406 rejection is still not a fan-out failure");
+
+            assert!(
+                !plan.had_unregistered_device,
+                "a 503 is not the server saying the device is unregistered"
+            );
+        }
+
+        /// A response with nothing rejected must not raise the flag either, or
+        /// every ordinary send would invalidate device lists.
+        #[tokio::test]
+        async fn a_clean_fetch_reports_no_unregistered_device() {
+            let warm: Jid = "5511900000081:0@s.whatsapp.net".parse().unwrap();
+
+            let (mut session_store, mut identity_store) =
+                stores_with_sessions(std::slice::from_ref(&warm)).await;
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+            let mut stores = raw_fanout_stores(
+                &mut sender_key_store,
+                &mut session_store,
+                &mut identity_store,
+                &mut prekey_store,
+                &signed_prekey_store,
+            );
+
+            let plan = ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &MockSendContextResolver::new(),
+                std::slice::from_ref(&warm),
+            )
+            .await
+            .expect("plan");
+
+            assert!(!plan.had_unregistered_device);
         }
 
         /// End to end through `prepare_dm_stanza`: recipient devices and own

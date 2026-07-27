@@ -18,13 +18,14 @@ impl SendContextResolver for Client {
         &self,
         jids: &[Jid],
     ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
-        self.fetch_pre_keys(jids, None).await
+        // The fan-out has its own batch-level handling; it wants the bundles only.
+        self.fetch_pre_keys(jids, None).await.map(|o| o.bundles)
     }
 
     async fn fetch_prekeys_for_identity_check(
         &self,
         jids: &[Jid],
-    ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
+    ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
         self.fetch_pre_keys(jids, Some(PreKeyFetchReason::Identity))
             .await
             .map_err(|e| {
