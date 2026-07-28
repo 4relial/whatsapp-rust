@@ -299,7 +299,7 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         user_agent.len()
     };
 
-    let server_kind = jid::Server::try_from(server).ok();
+    let server_kind = jid::Server::parse_known(server);
     let domain_type = match server_kind {
         Some(jid::Server::Pn) => 0,
         Some(jid::Server::Lid) => 1,
