@@ -353,6 +353,7 @@ impl Client {
             connected_notifier: Arc::new(event_listener::Event::new()),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
+            pairing_qr_refresh_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
             passkey_opening: AtomicBool::new(false),
@@ -922,6 +923,20 @@ impl Client {
     #[cfg(not(feature = "client-lifecycle"))]
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
         self.cleanup_connection_state_inner().await;
+        self.clear_connection_scoped_pair_code().await;
+    }
+
+    /// A pair-code flow belongs to the connection that carried it: the pairing
+    /// ref and any in-flight `companion_hello` die with the socket, and the
+    /// server routes no `primary_hello` to a session it has dropped. Left
+    /// standing, the outstanding-code guard would reject the very request that
+    /// reconnecting exists to make.
+    ///
+    /// Runs after the inner teardown, so the generation is already retired and
+    /// the transport already closed: a request that claims the slot from here
+    /// on is one the next connection will carry.
+    async fn clear_connection_scoped_pair_code(self: &Arc<Self>) {
+        *self.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Idle;
     }
 
     #[cfg_attr(
@@ -932,6 +947,7 @@ impl Client {
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
         if self.lifecycle.is_none() {
             self.cleanup_connection_state_inner().await;
+            self.clear_connection_scoped_pair_code().await;
             return;
         }
 
@@ -951,6 +967,7 @@ impl Client {
             Ok(Err(panic)) => std::panic::resume_unwind(panic),
             Err(_) => error!("Detached connection cleanup stopped before completion"),
         }
+        self.clear_connection_scoped_pair_code().await;
     }
 
     async fn cleanup_connection_state_inner(&self) {

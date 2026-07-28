@@ -203,9 +203,13 @@ impl Serialize for LazyHistorySync {
 }
 
 /// Discriminant for each [`Event`] variant, used to express handler interest
-/// without materializing the event. One per `Event` variant, in declaration
-/// order; the value doubles as a bit index in [`EventInterest`], so there can
-/// be at most 128 kinds.
+/// without materializing the event. One per `Event` variant; the value doubles
+/// as a bit index in [`EventInterest`], so there can be at most 128 kinds.
+///
+/// New kinds go at the **end**, whatever position their `Event` variant takes:
+/// the discriminant is what a consumer persists or transmits, and inserting in
+/// the middle renumbers every kind after it. `ServerAck` and
+/// `PairingQrCodesExhausted` both sit here for that reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -268,6 +272,7 @@ pub enum EventKind {
     PairPasskeyConfirmation,
     PairPasskeyError,
     ServerAck,
+    PairingQrCodesExhausted,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -281,7 +286,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ServerAck as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::PairingQrCodesExhausted as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -813,6 +818,7 @@ pub enum Event {
     PairingQrCode(PairingQrCode),
     PairingCode(PairingCode),
     PairingCodeRefresh(PairingCodeRefresh),
+    PairingQrCodesExhausted(PairingQrCodesExhausted),
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
 
@@ -989,6 +995,7 @@ impl Event {
             Event::PairingQrCode(_) => EventKind::PairingQrCode,
             Event::PairingCode(_) => EventKind::PairingCode,
             Event::PairingCodeRefresh(_) => EventKind::PairingCodeRefresh,
+            Event::PairingQrCodesExhausted(_) => EventKind::PairingQrCodesExhausted,
             Event::QrScannedWithoutMultidevice(_) => EventKind::QrScannedWithoutMultidevice,
             Event::ClientOutdated(_) => EventKind::ClientOutdated,
             Event::Messages(_) => EventKind::Messages,
@@ -1211,17 +1218,38 @@ pub struct PairingCode {
     pub timeout: std::time::Duration,
 }
 
-/// The server asked the companion to refresh an in-progress phone-number
-/// pairing code (WA Web `refreshAltLinkingCode` / `forceManualRefresh`).
-/// Only emitted while a pair-code flow is outstanding and the server's ref
-/// matches it. The consumer should request a fresh code via
-/// `pair_with_code`; the previous code is no longer guaranteed valid.
+/// The in-progress phone-number pairing code should be replaced.
+///
+/// Emitted for the two cases WA Web regenerates on
+/// (`Alt/DeviceLinkingApi.js` + `Link/DevicePhoneNumberCodeScreen.react.js`):
+/// the server asking for it (`refreshAltLinkingCode` / `forceManualRefresh`,
+/// ref-gated against the outstanding flow), and a `companion_finish` that went
+/// unanswered for a minute — a primary that could not open the key bundle just
+/// goes quiet, so silence is the only signal there is.
+///
+/// The outstanding flow is cleared before this fires, so the consumer can call
+/// `pair_with_code` straight away. The previous code is no longer valid.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct PairingCodeRefresh {
     /// `true` when the server set `force_manual_refresh` — the code must be
     /// re-requested explicitly rather than auto-rotated.
     pub force_manual: bool,
+}
+
+/// The server's `<pair-device>` refs are used up: there is no QR left to
+/// render until the connection is re-established.
+///
+/// WA Web's rotation timer (`Handle/PairDevice.js`) reports `UNPAIRED_IDLE`
+/// here and stops — it does not close the socket, because an alt-linking
+/// (phone-number) flow may still be riding the same connection.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairingQrCodesExhausted {
+    /// `true` when the client closed the connection itself, which it only does
+    /// with no pair-code flow outstanding. `false` means the socket was left
+    /// up and reconnecting is the consumer's call.
+    pub disconnected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
