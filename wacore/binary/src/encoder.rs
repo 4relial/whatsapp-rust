@@ -299,7 +299,10 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         user_agent.len()
     };
 
-    let server_kind = jid::Server::try_from(server).ok();
+    // `parse_known` and not `try_from(..).ok()`: the encoder asks this of every
+    // short string holding an `@` (message bodies with e-mail addresses, for
+    // one), and the `TryFrom` error carries a formatted `String` nobody reads.
+    let server_kind = jid::Server::parse_known(server);
     let domain_type = match server_kind {
         Some(jid::Server::Pn) => 0,
         Some(jid::Server::Lid) => 1,

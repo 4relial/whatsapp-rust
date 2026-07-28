@@ -21,141 +21,138 @@ pub struct ParsedJidParts<'a> {
 /// Returns `None` for JIDs that need full validation (edge cases, unknown servers, etc.)
 #[inline]
 pub fn parse_jid_fast(s: &str) -> Option<ParsedJidParts<'_>> {
-    if s.is_empty() {
-        return None;
-    }
+    parse_jid_scan(s).map(|(parts, _)| parts)
+}
 
+/// Shared scanner behind [`parse_jid_fast`] and [`parse_jid_ref`]. The resolved
+/// [`Server`] comes back alongside the borrowed parts because the scan already
+/// had to classify the server to know whether dots in the user part are agent
+/// separators — returning it lets `parse_jid_ref` skip a second lookup.
+///
+/// `None` in the second slot means the server suffix is not one we know; the
+/// parts are still filled in (with the generic agent/device rules), which is
+/// what `parse_jid_fast`'s callers rely on.
+#[inline]
+fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
     let bytes = s.as_bytes();
 
-    // Single pass to find key separator positions
-    let mut at_pos: Option<usize> = None;
+    // One pass over the *user* part only: everything after `@` is the server,
+    // which carries no separators we care about, so the scan stops there.
+    let mut at = usize::MAX;
     let mut colon_pos: Option<usize> = None;
     let mut last_dot_pos: Option<usize> = None;
 
     for (i, &b) in bytes.iter().enumerate() {
         match b {
-            b'@' if at_pos.is_none() => at_pos = Some(i),
-            // Only track colon in user part (before @)
-            b':' if at_pos.is_none() => colon_pos = Some(i),
-            // Only track dots in user part (before @ and before :)
-            b'.' if at_pos.is_none() && colon_pos.is_none() => last_dot_pos = Some(i),
+            b'@' => {
+                at = i;
+                break;
+            }
+            b':' => colon_pos = Some(i),
+            // Dots after the first colon belong to the device, not the agent.
+            b'.' if colon_pos.is_none() => last_dot_pos = Some(i),
             _ => {}
         }
     }
 
-    // Extract at_pos as concrete value - after this point we know @ exists
-    let at = match at_pos {
-        Some(pos) => pos,
-        None => {
-            // Server-only JID - let the fallback validate it
-            return None;
-        }
-    };
-
-    let user_part = &s[..at];
-    let server = &s[at + 1..];
-
-    // Validate that user_part is not empty
-    if user_part.is_empty() {
+    // No `@` (server-only JID) or an empty user: let the fallback validate it.
+    if at == usize::MAX || at == 0 {
         return None;
     }
 
-    // Fast path for LID JIDs - dots in user are not agent separators
-    if server == HIDDEN_USER_SERVER {
-        let (user, device) = match colon_pos {
-            Some(pos) if pos < at => {
-                let device_slice = &s[pos + 1..at];
-                (&s[..pos], device_slice.parse::<u16>().unwrap_or(0))
-            }
-            _ => (user_part, 0),
-        };
-        return Some(ParsedJidParts {
-            user,
-            server,
-            agent: 0,
-            device,
-            integrator: 0,
-        });
-    }
+    let user_part = &s[..at];
+    let server_str = &s[at + 1..];
+    let server = Server::parse_known(server_str);
 
-    // For DEFAULT_USER_SERVER (s.whatsapp.net), handle legacy dot format as device
-    if server == DEFAULT_USER_SERVER {
-        // Check for colon format first (modern: user:device@server)
-        if let Some(pos) = colon_pos {
-            let user_end = pos;
-            let device_start = pos + 1;
-            let device_slice = &s[device_start..at];
-            let device = device_slice.parse::<u16>().unwrap_or(0);
-            return Some(ParsedJidParts {
-                user: &s[..user_end],
-                server,
-                agent: 0,
-                device,
-                integrator: 0,
-            });
-        }
-        // Check for legacy dot format (legacy: user.device@server)
-        if let Some(dot_pos) = last_dot_pos {
-            // dot_pos is absolute position in s
-            let suffix = &s[dot_pos + 1..at];
-            if let Ok(device_val) = suffix.parse::<u16>() {
-                return Some(ParsedJidParts {
-                    user: &s[..dot_pos],
-                    server,
+    match server {
+        // LID user parts may contain dots, which are not agent separators.
+        Some(Server::Lid) => {
+            let (user, device) = match colon_pos {
+                Some(pos) => (&s[..pos], s[pos + 1..at].parse::<u16>().unwrap_or(0)),
+                None => (user_part, 0),
+            };
+            Some((
+                ParsedJidParts {
+                    user,
+                    server: server_str,
                     agent: 0,
-                    device: device_val,
+                    device,
                     integrator: 0,
-                });
-            }
+                },
+                server,
+            ))
         }
-        // No device component
-        return Some(ParsedJidParts {
-            user: user_part,
-            server,
-            agent: 0,
-            device: 0,
-            integrator: 0,
-        });
+        // `s.whatsapp.net` has no agent in the string form; a trailing dotted
+        // number is the legacy device spelling.
+        Some(Server::Pn) => {
+            if let Some(pos) = colon_pos {
+                return Some((
+                    ParsedJidParts {
+                        user: &s[..pos],
+                        server: server_str,
+                        agent: 0,
+                        device: s[pos + 1..at].parse::<u16>().unwrap_or(0),
+                        integrator: 0,
+                    },
+                    server,
+                ));
+            }
+            if let Some(dot_pos) = last_dot_pos
+                && let Ok(device_val) = s[dot_pos + 1..at].parse::<u16>()
+            {
+                return Some((
+                    ParsedJidParts {
+                        user: &s[..dot_pos],
+                        server: server_str,
+                        agent: 0,
+                        device: device_val,
+                        integrator: 0,
+                    },
+                    server,
+                ));
+            }
+            Some((
+                ParsedJidParts {
+                    user: user_part,
+                    server: server_str,
+                    agent: 0,
+                    device: 0,
+                    integrator: 0,
+                },
+                server,
+            ))
+        }
+        // Everything else (including unknown servers): `user.agent:device`.
+        _ => {
+            let (user_before_colon, device) = match colon_pos {
+                Some(pos) => (&s[..pos], s[pos + 1..at].parse::<u16>().unwrap_or(0)),
+                None => (user_part, 0),
+            };
+            // Deliberately `rfind` on the pre-colon slice rather than reusing
+            // `last_dot_pos`: the two differ for pathological users that hold a
+            // second colon (`a:1.5:2`), and this branch is cold enough that
+            // matching the historical rule is worth the extra scan.
+            let (final_user, agent) = match user_before_colon.rfind('.') {
+                Some(dot_pos) => match user_before_colon[dot_pos + 1..].parse::<u16>() {
+                    Ok(agent_val) if agent_val <= u8::MAX as u16 => {
+                        (&user_before_colon[..dot_pos], agent_val as u8)
+                    }
+                    _ => (user_before_colon, 0),
+                },
+                None => (user_before_colon, 0),
+            };
+            Some((
+                ParsedJidParts {
+                    user: final_user,
+                    server: server_str,
+                    agent,
+                    device,
+                    integrator: 0,
+                },
+                server,
+            ))
+        }
     }
-
-    // Parse device from colon separator (user:device@server)
-    let (user_before_colon, device) = match colon_pos {
-        Some(pos) => {
-            // Colon is at `pos` in the original string
-            let user_end = pos;
-            let device_start = pos + 1;
-            let device_slice = &s[device_start..at];
-            (&s[..user_end], device_slice.parse::<u16>().unwrap_or(0))
-        }
-        None => (user_part, 0),
-    };
-
-    // Parse agent from last dot in user part (for non-default, non-LID servers)
-    let user_to_check = user_before_colon;
-    let (final_user, agent) = {
-        if let Some(dot_pos) = user_to_check.rfind('.') {
-            let suffix = &user_to_check[dot_pos + 1..];
-            if let Ok(agent_val) = suffix.parse::<u16>() {
-                if agent_val <= u8::MAX as u16 {
-                    (&user_to_check[..dot_pos], agent_val as u8)
-                } else {
-                    (user_to_check, 0)
-                }
-            } else {
-                (user_to_check, 0)
-            }
-        } else {
-            (user_to_check, 0)
-        }
-    };
-
-    Some(ParsedJidParts {
-        user: final_user,
-        server,
-        agent,
-        device,
-        integrator: 0,
-    })
 }
 
 /// Parse the allocation-free JID shapes into the same borrowed type used by
@@ -166,10 +163,10 @@ pub fn parse_jid_fast(s: &str) -> Option<ParsedJidParts<'_>> {
 /// back to `s.parse::<Jid>()`; normal user/group/LID/bot JIDs stay borrowed.
 #[inline]
 pub fn parse_jid_ref(s: &str) -> Option<JidRef<'_>> {
-    let parts = parse_jid_fast(s)?;
+    let (parts, server) = parse_jid_scan(s)?;
     Some(JidRef {
         user: NodeStr::Borrowed(parts.user),
-        server: Server::try_from(parts.server).ok()?,
+        server: server?,
         agent: parts.agent,
         device: parts.device,
         integrator: parts.integrator,
@@ -315,24 +312,36 @@ impl PartialEq<&str> for Server {
     }
 }
 
+impl Server {
+    /// Allocation-free server lookup. `TryFrom<&str>` builds a `JidError` —
+    /// and therefore a `String` — for an unknown suffix, which the JID scanner
+    /// hits on every non-JID string it is asked to classify; this returns the
+    /// same answer without paying for the message nobody reads.
+    #[inline]
+    pub fn parse_known(s: &str) -> Option<Self> {
+        Some(match s {
+            "s.whatsapp.net" => Self::Pn,
+            "lid" => Self::Lid,
+            "g.us" => Self::Group,
+            "broadcast" => Self::Broadcast,
+            "newsletter" => Self::Newsletter,
+            "hosted" => Self::Hosted,
+            "hosted.lid" => Self::HostedLid,
+            "msgr" => Self::Messenger,
+            "interop" => Self::Interop,
+            "bot" => Self::Bot,
+            "c.us" => Self::Legacy,
+            "call" => Self::Call,
+            _ => return None,
+        })
+    }
+}
+
 impl TryFrom<&str> for Server {
     type Error = JidError;
     fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "s.whatsapp.net" => Ok(Self::Pn),
-            "lid" => Ok(Self::Lid),
-            "g.us" => Ok(Self::Group),
-            "broadcast" => Ok(Self::Broadcast),
-            "newsletter" => Ok(Self::Newsletter),
-            "hosted" => Ok(Self::Hosted),
-            "hosted.lid" => Ok(Self::HostedLid),
-            "msgr" => Ok(Self::Messenger),
-            "interop" => Ok(Self::Interop),
-            "bot" => Ok(Self::Bot),
-            "c.us" => Ok(Self::Legacy),
-            "call" => Ok(Self::Call),
-            other => Err(JidError::InvalidFormat(format!("unknown server: {other}"))),
-        }
+        Server::parse_known(s)
+            .ok_or_else(|| JidError::InvalidFormat(format!("unknown server: {s}")))
     }
 }
 
@@ -1487,6 +1496,44 @@ mod tests {
 
         assert!(parse_jid_ref("g.us").is_none(), "server-only uses fallback");
         assert!(parse_jid_ref("user@unknown").is_none());
+    }
+
+    /// The scan stops at the first `@` and dispatches on the resolved `Server`,
+    /// so every separator rule it folded together needs a case here: which
+    /// separator wins per server, and the pathological users where the agent
+    /// rule reads a different dot than the scan recorded.
+    #[test]
+    fn fast_parse_separator_rules_match_the_full_parser() {
+        for raw in [
+            // Dots are agent separators on generic servers, but not on lid, and
+            // on s.whatsapp.net a trailing dotted number is the legacy device.
+            "123456789.4:17@interop",
+            "123456789.4@interop",
+            "5511999998888.2@s.whatsapp.net",
+            "12345.678@lid",
+            "12345.678:9@lid",
+            // A second colon puts the last dot after the first one, which is
+            // where a naive reuse of the scanned dot position would diverge.
+            "a:1.5:2@bot",
+            "a.5:1:2@bot",
+            // Agent overflowing u8 falls back to no agent at all.
+            "123.999@interop",
+            // Unparsable device degrades to 0 rather than rejecting the JID.
+            "5511999998888:x@s.whatsapp.net",
+        ] {
+            let fast =
+                parse_jid_fast(raw).unwrap_or_else(|| panic!("{raw} should take the fast path"));
+            let owned = raw.parse::<Jid>().unwrap_or_else(|e| panic!("{raw}: {e}"));
+
+            assert_eq!(fast.user, owned.user, "user mismatch for {raw}");
+            assert_eq!(fast.agent, owned.agent, "agent mismatch for {raw}");
+            assert_eq!(fast.device, owned.device, "device mismatch for {raw}");
+            assert_eq!(
+                fast.server,
+                owned.server.as_str(),
+                "server mismatch for {raw}"
+            );
+        }
     }
 
     #[test]
