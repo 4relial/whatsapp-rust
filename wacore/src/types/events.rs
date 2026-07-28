@@ -1230,17 +1230,54 @@ pub struct QrScannedWithoutMultidevice {}
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
-pub struct ClientOutdated {}
+pub struct ClientOutdated {
+    /// The whole `<failure>` stanza, so no attribute is lost to a log line.
+    pub raw: Option<Node>,
+}
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct Connected {}
+
+/// Localized text the server wants shown when it forces a logout, from
+/// `logout_message_header` / `logout_message_subtext` on `<failure>`.
+///
+/// `locale` is what makes the text safe to render: WA Web
+/// (`WAWebHandleFailure`) shows the header/subtext only when the locale equals
+/// the client's current one, and otherwise falls back to its own generic copy.
+/// It travels with the text so a consumer can apply the same rule.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct LogoutMessage {
+    pub header: Option<String>,
+    pub subtext: Option<String>,
+    /// e.g. `"pt_BR"`. Compare against the consumer's locale before rendering.
+    pub locale: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct LoggedOut {
     pub on_connect: bool,
     pub reason: ConnectFailureReason,
+    /// Server-supplied logout copy, when it sent any. Present in practice on
+    /// [`ConnectFailureReason::AccountLocked`].
+    pub logout_message: Option<LogoutMessage>,
+    /// The whole stanza that caused the logout, when one did.
+    ///
+    /// Two shapes reach here, so dispatch on `raw.tag` rather than assuming
+    /// one: `<failure>` for a server-side refusal (`on_connect` is then true),
+    /// and `<stream:error>` for a `<conflict>`, a 516 device removal or a 401.
+    /// `None` when nothing was received at all — a locally initiated logout has
+    /// no stanza to report.
+    ///
+    /// A forced logout is where the server puts data it will never repeat: an
+    /// account lock carries a one-time `appeal_token` plus `violation_reason`
+    /// and `vt`, which WA Web ignores (its own appeal flow is native) but which
+    /// an embedder cannot recover once the stanza is gone. Parsing policy stays
+    /// with the consumer — `violation_reason` is not a closed set — but the
+    /// bytes have to survive the dispatch.
+    pub raw: Option<Node>,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -1286,7 +1323,21 @@ impl fmt::Display for TempBanReason {
 #[non_exhaustive]
 pub struct TemporaryBan {
     pub code: TempBanReason,
+    /// How long the ban lasts — the wire's `expire` is a duration in seconds,
+    /// not a deadline (WA Web renders it as "You'll be able to use WhatsApp
+    /// again in {duration}").
+    ///
+    /// Dispatched only when the server sent an `expire` that fits a `Duration`;
+    /// a ban stanza missing `code`/`expire`, or carrying one that does not,
+    /// surfaces as [`Event::ConnectFailure`] instead, the way WA Web rejects it
+    /// rather than inventing a zero.
     pub expire: Duration,
+    /// The server's `message` attribute, when present.
+    pub message: Option<String>,
+    /// Support/appeal link the official UI opens for the ban.
+    pub url: Option<String>,
+    /// The whole `<failure>` stanza.
+    pub raw: Option<Node>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
