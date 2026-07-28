@@ -1502,37 +1502,45 @@ mod tests {
     /// so every separator rule it folded together needs a case here: which
     /// separator wins per server, and the pathological users where the agent
     /// rule reads a different dot than the scan recorded.
+    ///
+    /// Asserted against written-out values rather than against `str::parse`,
+    /// which would prove nothing: `FromStr` tries `parse_jid_ref` first, so for
+    /// any server this path accepts it would be comparing the scanner with
+    /// itself. These are the values `main` produces for the same inputs.
     #[test]
-    fn fast_parse_separator_rules_match_the_full_parser() {
-        for raw in [
-            // Dots are agent separators on generic servers, but not on lid, and
-            // on s.whatsapp.net a trailing dotted number is the legacy device.
-            "123456789.4:17@interop",
-            "123456789.4@interop",
-            "5511999998888.2@s.whatsapp.net",
-            "12345.678@lid",
-            "12345.678:9@lid",
+    fn fast_parse_pins_the_separator_rules_per_server() {
+        // (input, user, agent, device)
+        let cases = [
+            // Generic servers read a trailing dotted number as the agent.
+            ("123456789.4:17@interop", "123456789", 4u8, 17u16),
+            ("123456789.4@interop", "123456789", 4, 0),
+            // ...but an agent past u8 leaves the user whole instead.
+            ("123.999@interop", "123.999", 0, 0),
+            // On s.whatsapp.net that same trailing number is the legacy device.
+            ("5511999998888.2@s.whatsapp.net", "5511999998888", 0, 2),
+            // Dots in a lid user are part of the user.
+            ("12345.678@lid", "12345.678", 0, 0),
+            ("12345.678:9@lid", "12345.678", 0, 9),
+            // `hosted.lid` and `c.us` are NOT in the lid family here — they take
+            // the generic rule, so a dotted number that fits in u8 becomes the
+            // agent. Pinned as the pre-existing behaviour, not endorsed as
+            // correct; changing it needs WA Web as ground truth, not this PR.
+            ("12345.6@hosted.lid", "12345", 6, 0),
+            ("12345.678@hosted.lid", "12345.678", 0, 0),
+            ("12345.6@c.us", "12345", 6, 0),
             // A second colon puts the last dot after the first one, which is
-            // where a naive reuse of the scanned dot position would diverge.
-            "a:1.5:2@bot",
-            "a.5:1:2@bot",
-            // Agent overflowing u8 falls back to no agent at all.
-            "123.999@interop",
+            // where reusing the scanned dot position would silently diverge.
+            ("a:1.5:2@bot", "a:1", 5, 2),
             // Unparsable device degrades to 0 rather than rejecting the JID.
-            "5511999998888:x@s.whatsapp.net",
-        ] {
+            ("5511999998888:x@s.whatsapp.net", "5511999998888", 0, 0),
+        ];
+
+        for (raw, user, agent, device) in cases {
             let fast =
                 parse_jid_fast(raw).unwrap_or_else(|| panic!("{raw} should take the fast path"));
-            let owned = raw.parse::<Jid>().unwrap_or_else(|e| panic!("{raw}: {e}"));
-
-            assert_eq!(fast.user, owned.user, "user mismatch for {raw}");
-            assert_eq!(fast.agent, owned.agent, "agent mismatch for {raw}");
-            assert_eq!(fast.device, owned.device, "device mismatch for {raw}");
-            assert_eq!(
-                fast.server,
-                owned.server.as_str(),
-                "server mismatch for {raw}"
-            );
+            assert_eq!(fast.user, user, "user for {raw}");
+            assert_eq!(fast.agent, agent, "agent for {raw}");
+            assert_eq!(fast.device, device, "device for {raw}");
         }
     }
 
