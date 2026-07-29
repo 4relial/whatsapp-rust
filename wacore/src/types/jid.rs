@@ -1,6 +1,6 @@
 use crate::libsignal::protocol::{AddressBuf, DeviceId, ProtocolAddress};
 use crate::libsignal::store::sender_key_name::SenderKeyName;
-use wacore_binary::{DEFAULT_USER_SERVER, Jid, LEGACY_USER_SERVER};
+use wacore_binary::{DEFAULT_USER_SERVER, Jid, LEGACY_USER_SERVER, Server};
 
 /// Real WhatsApp logs show max signal address length of 53 chars.
 /// 64 bytes covers all known addresses without reallocation.
@@ -108,18 +108,28 @@ pub fn sort_dedup_by_user(jids: &mut Vec<Jid>) {
     jids.dedup_by(|a, b| a.user == b.user && a.server == b.server);
 }
 
-/// Sort and deduplicate by device identity (user + server + agent + device).
+/// Sort and deduplicate by device identity.
+///
+/// Keyed on exactly what `Jid`'s equality compares — user, server, device,
+/// integrator, and `identity_agent` — so the fan-out cannot disagree with `==`
+/// in either direction. Both directions are real: keying on the raw `agent`
+/// would let two JIDs that are one device (an inert agent on Pn/Lid/Hosted/
+/// HostedLid, same AD-JID, same Signal address) both survive and give one
+/// session two concurrent encryption jobs; dropping the agent entirely would
+/// collapse two genuinely different `@bot`/`@interop` devices, which do render
+/// it, and silently lose a destination.
 pub fn sort_dedup_by_device(jids: &mut Vec<Jid>) {
-    jids.sort_unstable_by(|a, b| {
-        a.user
-            .cmp(&b.user)
-            .then_with(|| a.server.cmp(&b.server))
-            .then_with(|| a.agent.cmp(&b.agent))
-            .then_with(|| a.device.cmp(&b.device))
-    });
-    jids.dedup_by(|a, b| {
-        a.user == b.user && a.server == b.server && a.agent == b.agent && a.device == b.device
-    });
+    fn key(j: &Jid) -> (&str, Server, u16, u16, u8) {
+        (
+            &j.user,
+            j.server,
+            j.device,
+            j.integrator,
+            j.identity_agent(),
+        )
+    }
+    jids.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+    jids.dedup_by(|a, b| key(a) == key(b));
 }
 
 /// Build a `SenderKeyName` from a `&Jid` + `&ProtocolAddress` in a single
@@ -338,5 +348,90 @@ mod tests {
 
         write_protocol_address_to(&second, &mut buf);
         assert_eq!(buf.as_str(), "123456789:33@lid.0");
+    }
+
+    /// The fan-out uses this to collapse duplicate wire destinations, so it has
+    /// to agree with `Jid`'s equality. Two LID JIDs differing only in the agent
+    /// are one device — same AD-JID on the wire, same Signal address — and must
+    /// not both survive, or the group send builds two encryption jobs against
+    /// one session.
+    #[test]
+    fn device_dedup_collapses_jids_that_differ_only_in_an_inert_agent() {
+        let plain = Jid {
+            user: "123456789012345".into(),
+            server: Server::Lid,
+            agent: 0,
+            device: 33,
+            integrator: 0,
+        };
+        let with_agent = Jid {
+            agent: 1,
+            ..plain.clone()
+        };
+        assert_eq!(plain, with_agent, "precondition: one identity");
+        assert_eq!(
+            plain.to_signal_address_string(),
+            with_agent.to_signal_address_string(),
+            "precondition: one Signal address"
+        );
+
+        let mut jids = vec![plain.clone(), with_agent];
+        sort_dedup_by_device(&mut jids);
+        assert_eq!(jids, vec![plain.clone()], "one device, one entry");
+
+        // A different device still survives as its own entry.
+        let other_device = Jid {
+            device: 34,
+            ..plain.clone()
+        };
+        let mut jids = vec![plain.clone(), other_device.clone()];
+        sort_dedup_by_device(&mut jids);
+        assert_eq!(jids.len(), 2);
+    }
+
+    /// The mirror of the case above: on the servers that DO render the agent it
+    /// is identity, `==` treats those JIDs as different devices, and collapsing
+    /// them here would silently drop a destination from the fan-out.
+    #[test]
+    fn device_dedup_keeps_agents_apart_where_the_server_renders_them() {
+        for server in [Server::Bot, Server::Interop] {
+            let a = Jid {
+                user: "123456789".into(),
+                server,
+                agent: 1,
+                device: 0,
+                integrator: 0,
+            };
+            let b = Jid {
+                agent: 2,
+                ..a.clone()
+            };
+            assert_ne!(a, b, "{server:?}: renders the agent, so these differ");
+
+            let mut jids = vec![a, b];
+            sort_dedup_by_device(&mut jids);
+            assert_eq!(
+                jids.len(),
+                2,
+                "{server:?}: dedup must not merge two rendered agents"
+            );
+        }
+
+        // `integrator` is identity too, and the key has to carry it.
+        let base = Jid {
+            user: "123456789".into(),
+            server: Server::Interop,
+            agent: 0,
+            device: 0,
+            integrator: 1,
+        };
+        let other = Jid {
+            integrator: 2,
+            ..base.clone()
+        };
+        assert_ne!(base, other);
+        let mut jids = vec![base, other];
+        sort_dedup_by_device(&mut jids);
+        assert_eq!(jids.len(), 2, "integrator must not be dropped from the key");
     }
 }
