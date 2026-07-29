@@ -1108,19 +1108,20 @@ mod tests {
         assert!(media.enc_for(Some(&other)).is_none());
     }
 
-    // Regression: a LID `<to jid>` decoded from the wire is an AD-JID carrying agent=1 (the Lid domain
-    // byte); our own LID is agent=1 too. The parser must read the TYPED jid (`to_jid`), never
-    // stringify+reparse it (which drops the agent to 0, since `renders_agent(Lid)` is false), or a
-    // multi-device callee never matches its `<to>` and silently fails "offer carried no callKey",
-    // even against the real server. The typed Jid value with agent=1 here is exactly what
-    // `as_node_ref`/the decoder carries for an AD-JID.
+    // Regression: `enc_for` matches `<to jid>` against our own JID by full structural
+    // equality, so a `<to>` that came off the wire and a JID that came from text have
+    // to agree field for field. When they did not, a multi-device callee never matched
+    // its `<to>` and silently failed "offer carried no callKey" against the real
+    // server. The stanza goes through marshal/unmarshal here so the `<to jid>` is
+    // produced by the real AD-JID decode rather than handed to the parser as an
+    // already-built value.
     #[cfg(feature = "voip")]
     #[test]
-    fn offer_to_jid_keeps_lid_agent_from_typed_jid() {
+    fn offer_to_jid_matches_our_own_jid_field_for_field() {
         let wire_to = Jid {
             user: "111111111111111".into(),
             server: Server::Lid,
-            agent: 1, // the AD-JID domain byte; the string form suppresses it
+            agent: 0,
             device: 7,
             integrator: 0,
         };
@@ -1138,13 +1139,23 @@ mod tests {
                 .build()])
             .build();
 
-        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        // marshal writes a leading format byte that unmarshal_ref does not expect.
+        let bytes = wacore_binary::marshal::marshal(&node).unwrap();
+        let decoded = wacore_binary::marshal::unmarshal_ref(&bytes[1..]).unwrap();
+        let call = parse_call_stanza(&decoded).unwrap().unwrap();
         let media = call.media.expect("offer captures media");
 
-        // Our own device LID as lid() yields it: agent=1.
+        let from_wire = media.encs[0].to.as_ref().expect("<to jid> survives decode");
+        let from_text: Jid = "111111111111111:7@lid".parse().unwrap();
+        assert_eq!(
+            from_wire, &from_text,
+            "the decoded <to jid> must equal the same JID read back as text, which is \
+             how our own LID reaches `enc_for`"
+        );
+
         assert_eq!(
             media
-                .enc_for(Some(&wire_to))
+                .enc_for(Some(&from_text))
                 .expect("callKey for our device")
                 .ciphertext,
             vec![0xB2],

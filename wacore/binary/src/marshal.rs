@@ -265,6 +265,53 @@ mod tests {
 
     type TestResult = Result<()>;
 
+    /// The two round-trips real code performs — through the wire, and through the
+    /// store, which holds JIDs as text — have to agree: a JID that survives one
+    /// must equal a JID that survives the other, or `stored_jid == wire_jid`
+    /// silently flips depending on where each side came from.
+    #[test]
+    fn ad_jid_round_trips_equal_through_the_wire_and_through_text() -> TestResult {
+        use crate::jid::Server;
+        use std::str::FromStr;
+
+        for server in [Server::Pn, Server::Lid, Server::Hosted, Server::HostedLid] {
+            let original = Jid {
+                user: "123456789012345".into(),
+                server,
+                agent: 0,
+                device: 7,
+                integrator: 0,
+            };
+
+            let mut attrs = Attrs::with_capacity(1);
+            attrs.push("jid".to_string(), NodeValue::Jid(original.clone()));
+            let node = Node::new("iq", attrs, None);
+
+            // marshal writes a leading format byte that unmarshal_ref does not expect.
+            let bytes = marshal(&node)?;
+            let decoded = unmarshal_ref(&bytes[1..])?;
+            let from_wire = decoded
+                .attrs
+                .iter()
+                .find(|(k, _)| &**k == "jid")
+                .and_then(|(_, v)| v.to_jid())
+                .expect("jid attr survives the round-trip");
+
+            assert_eq!(
+                from_wire, original,
+                "{server:?}: encode -> decode must be idempotent"
+            );
+
+            let from_text = Jid::from_str(&from_wire.to_string()).expect("renders parseably");
+            assert_eq!(
+                from_wire, from_text,
+                "{server:?}: a wire-decoded JID must equal the same JID read back as text"
+            );
+        }
+
+        Ok(())
+    }
+
     fn fixture_node() -> Node {
         let mut attrs = Attrs::with_capacity(4);
         attrs.push("id".to_string(), "ABC123");
