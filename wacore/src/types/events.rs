@@ -273,6 +273,7 @@ pub enum EventKind {
     PairPasskeyError,
     ServerAck,
     PairingQrCodesExhausted,
+    PairingCodeError,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -286,7 +287,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::PairingQrCodesExhausted as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::PairingCodeError as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -818,6 +819,7 @@ pub enum Event {
     PairingQrCode(PairingQrCode),
     PairingCode(PairingCode),
     PairingCodeRefresh(PairingCodeRefresh),
+    PairingCodeError(PairingCodeError),
     PairingQrCodesExhausted(PairingQrCodesExhausted),
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
@@ -995,6 +997,7 @@ impl Event {
             Event::PairingQrCode(_) => EventKind::PairingQrCode,
             Event::PairingCode(_) => EventKind::PairingCode,
             Event::PairingCodeRefresh(_) => EventKind::PairingCodeRefresh,
+            Event::PairingCodeError(_) => EventKind::PairingCodeError,
             Event::PairingQrCodesExhausted(_) => EventKind::PairingQrCodesExhausted,
             Event::QrScannedWithoutMultidevice(_) => EventKind::QrScannedWithoutMultidevice,
             Event::ClientOutdated(_) => EventKind::ClientOutdated,
@@ -1235,6 +1238,63 @@ pub struct PairingCodeRefresh {
     /// `true` when the server set `force_manual_refresh` — the code must be
     /// re-requested explicitly rather than auto-rotated.
     pub force_manual: bool,
+}
+
+/// A phone-number pair-code request failed, so no code will be shown.
+///
+/// The counterpart to [`PairingCode`] on the failure path, and the only surface
+/// that reports it when pairing is driven by `BotBuilder::with_pair_code` —
+/// that request runs in a detached task, so nothing returns its error to the
+/// caller. `Client::pair_with_code` dispatches this in addition to returning
+/// `Err`, matching how the success path both returns the code and emits
+/// [`PairingCode`].
+///
+/// Fires for every failure, including local validation (a phone number that is
+/// too short never reaches the server): a consumer waiting on a code needs to
+/// learn that it is not coming, whatever the reason. [`rejection`](Self::rejection)
+/// is what distinguishes the two — `None` means the request never got an answer
+/// from the server.
+///
+/// A claim the failed request itself took is released before this fires, so
+/// nothing is left holding the flow and `pair_with_code` can be called again.
+///
+/// Two failures do **not** arrive here, because for them a code may still be on
+/// its way and this event would say the opposite — a consumer acting on it
+/// would tear down a code that is about to arrive:
+///
+/// - `CodeAlreadyOutstanding` — refused precisely because an earlier code is
+///   still live, and the consumer already has it from the [`PairingCode`] that
+///   minted it. Retrying is futile until `cancel_pair_code` runs or the window
+///   closes.
+/// - `Cancelled` — the caller withdrew this request, and a replacement may
+///   already own the slot. A superseded request can return this *after* its
+///   replacement started, so the event would be uncorrelated with the flow that
+///   is actually running.
+///
+/// Both follow from something the caller did, so neither is news, and a direct
+/// caller still gets the `Err`.
+///
+/// Whether to retry at all is the point of the fields: back off on
+/// [`PairCodeRejection::is_throttled`](crate::pair_code::PairCodeRejection::is_throttled),
+/// stop on
+/// [`PairCodeRejection::FeatureNotAvailable`](crate::pair_code::PairCodeRejection::FeatureNotAvailable).
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct PairingCodeError {
+    /// The server's refusal, when it answered with one. `None` when the failure
+    /// was local (validation, no connection) or the request went unanswered
+    /// (timeout) — nothing was refused, so there is no status to report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<crate::pair_code::PairCodeRejection>,
+    /// How long the server asked the client to wait, from the `backoff`
+    /// attribute. Usually absent — WA Web does not read it on this path — but
+    /// when present it is the server naming its own retry delay, which beats
+    /// any interval the consumer would pick.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<std::time::Duration>,
+    /// The failure rendered for logs. Do not branch on it; use
+    /// [`rejection`](Self::rejection).
+    pub error: String,
 }
 
 /// The server's `<pair-device>` refs are used up: there is no QR left to
@@ -1869,6 +1929,63 @@ mod tests {
     use super::*;
     use buffa::Message;
     use waproto::whatsapp as wa;
+
+    /// A new kind must go at the end. The discriminant doubles as an
+    /// `EventInterest` bit index and is what a consumer persists or transmits,
+    /// so inserting one in the middle silently re-points every stored mask
+    /// after it at the wrong events.
+    ///
+    /// Pinned by value rather than by ordering: a spot check of the run's
+    /// start, the pair-code block a new kind is most tempting to sit inside,
+    /// and the two most-subscribed kinds past it.
+    #[test]
+    fn event_kind_discriminants_are_append_only() {
+        assert_eq!(EventKind::Connected as u8, 0);
+        assert_eq!(EventKind::PairingCode as u8, 6);
+        assert_eq!(EventKind::PairingCodeRefresh as u8, 7);
+        assert_eq!(EventKind::QrScannedWithoutMultidevice as u8, 8);
+        assert_eq!(EventKind::Messages as u8, 10);
+        assert_eq!(EventKind::Receipt as u8, 11);
+
+        // The two already parked at the end for this same reason, and the
+        // newest past both. Pinned absolutely rather than as an offset from its
+        // neighbour: a relative check still passes when a kind is inserted
+        // *before* the pair, which shifts all three together.
+        assert_eq!(EventKind::ServerAck as u8, 57);
+        assert_eq!(EventKind::PairingQrCodesExhausted as u8, 58);
+        assert_eq!(EventKind::PairingCodeError as u8, 59);
+    }
+
+    /// Every rejection a consumer can be handed must survive being persisted
+    /// and read back as itself.
+    ///
+    /// The wire form of `PairCodeRejection` is its `code()`, so an `Unknown`
+    /// carrying a *named* code would serialize to that code and rehydrate as the
+    /// named arm — silently upgrading a value we declined to classify. Nothing
+    /// may construct such a value; `from_server` returns `None` instead, and
+    /// this pins that the reachable ones round-trip.
+    #[test]
+    fn pair_code_rejections_do_not_alias_on_a_round_trip() {
+        use crate::pair_code::PairCodeRejection as R;
+
+        for original in [
+            R::BadRequest,
+            R::Forbidden,
+            R::RateOverlimit,
+            R::FeatureNotAvailable,
+            R::InternalServerError,
+            R::Unknown(418),
+        ] {
+            let json = serde_json::to_string(&original).expect("serializes");
+            let back: R = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, original, "{original:?} rehydrated as {back:?}");
+        }
+
+        // The aliasing that forced `from_server` to return `None`: kept as a
+        // live demonstration so the reason cannot be lost to a refactor.
+        assert_eq!(R::Unknown(429).code(), R::RateOverlimit.code());
+        assert_eq!(R::from_server(429, "something-else"), None);
+    }
 
     #[test]
     fn group_update_builder_defaults_additive_scalar_fields() {

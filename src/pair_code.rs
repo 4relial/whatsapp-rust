@@ -68,7 +68,7 @@ use wacore_binary::Jid;
 use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 
 pub use wacore::companion_reg::{CompanionOs, CompanionWebClientType};
-pub use wacore::pair_code::{PairCodeError, PairCodeOptions};
+pub use wacore::pair_code::{PairCodeError, PairCodeOptions, PairCodeRejection};
 
 /// Errors raised by the high-level pair-code flow.
 ///
@@ -90,8 +90,74 @@ pub enum PairError {
     /// OS, so a display-shaped rejection is already ruled out — see
     /// [`wacore::companion_reg::CompanionOs`].) Any server `backoff` hint is
     /// preserved on the wrapped [`IqError`].
-    #[error("pair-code IQ request failed")]
+    ///
+    /// Renders what it wraps, per the [rendering
+    /// convention](crate::error#rendering) — so the code and text reach a log
+    /// line that only prints the error, without the reader having to reach for
+    /// the `Debug` form.
+    #[error("{0}")]
     RequestFailed(#[from] IqError),
+}
+
+// Imported inside each body, not at module scope: `ErrorChainExt::as_dyn_error`
+// would then be ambiguous with thiserror's own `AsDynError` for every `#[from]`
+// in this module.
+impl PairError {
+    /// How the server refused the request, as a status to branch on.
+    ///
+    /// `None` when nothing was refused: local validation, no connection, or a
+    /// request that went unanswered. Prefer this to matching the message, which
+    /// is not a stable surface.
+    ///
+    /// Classified from the `code` and `text` together, so a pairing WA Web
+    /// would not accept yields `None` rather than the named arm — see
+    /// [`PairCodeRejection::from_server`]. The refused-but-unclassifiable case
+    /// is therefore indistinguishable here from "nothing was refused"; both
+    /// mean the same thing to a consumer, which is that there is no typed
+    /// status to act on and the message is all there is.
+    pub fn rejection(&self) -> Option<PairCodeRejection> {
+        use crate::error::ErrorChainExt;
+        self.server_rejection()
+            .and_then(|rejection| PairCodeRejection::from_server(rejection.code, rejection.text))
+    }
+
+    /// Whether this request lost the pairing flow to someone else rather than
+    /// ending it — so its failure says nothing about whether a code arrives.
+    ///
+    /// These are the failures [`Event::PairingCodeError`] must stay silent for,
+    /// because its meaning is "no code is coming" and here that is not what
+    /// happened:
+    ///
+    /// - [`PairCodeError::CodeAlreadyOutstanding`] — refused *because* an
+    ///   earlier code is still inside its validity window. That code is on
+    ///   screen and may yet be entered; the consumer already has it from the
+    ///   [`Event::PairingCode`] that minted it.
+    /// - [`PairCodeError::Cancelled`] — the caller withdrew this request via
+    ///   [`Client::cancel_pair_code`], and a replacement may already own the
+    ///   slot. Reporting the *predecessor* would let a consumer read the live
+    ///   replacement as failed and tear down a code that is about to arrive.
+    ///
+    /// Both are consequences of something the caller did, so neither is news to
+    /// them, and a direct caller still receives the `Err` either way.
+    pub fn lost_the_flow_to_another_request(&self) -> bool {
+        matches!(
+            self,
+            Self::PairCode(PairCodeError::CodeAlreadyOutstanding { .. } | PairCodeError::Cancelled)
+        )
+    }
+
+    /// How long the server asked the client to wait before retrying, from the
+    /// `backoff` attribute.
+    ///
+    /// Usually `None` — the server rarely populates it on this request, and WA
+    /// Web never reads it — but a value here is the server naming its own delay,
+    /// which beats an interval the consumer picked.
+    pub fn backoff(&self) -> Option<std::time::Duration> {
+        use crate::error::ErrorChainExt;
+        self.server_rejection()
+            .and_then(|rejection| rejection.backoff)
+            .map(|secs| std::time::Duration::from_secs(u64::from(secs)))
+    }
 }
 
 impl Client {
@@ -152,6 +218,62 @@ impl Client {
         tracing::instrument(name = "wa.pair.code", level = "debug", skip_all, err(Debug))
     )]
     pub async fn pair_with_code(
+        self: &Arc<Self>,
+        options: PairCodeOptions,
+    ) -> Result<String, PairError> {
+        // The failure is dispatched here rather than at each `return Err`
+        // below: stage 1 fails from a dozen places, and what a consumer needs
+        // from all of them is the same single fact — no code is coming. Wrapping
+        // the flow is also what stops a *later* early return from going
+        // unreported. `BotBuilder::with_pair_code` depends on it having no gaps,
+        // because it drives this from a detached task whose `Err` reaches nobody.
+        //
+        // Mirrors the success path, which likewise both returns the code and
+        // dispatches `Event::PairingCode`; a direct caller sees the failure
+        // twice, and a `with_pair_code` consumer sees it at all.
+        match self.pair_with_code_inner(options).await {
+            Ok(code) => Ok(code),
+            Err(e) if self.failure_is_not_this_flows_to_report(&e).await => Err(e),
+            Err(e) => {
+                self.core.event_bus.dispatch(Event::PairingCodeError(
+                    crate::types::events::PairingCodeError::builder()
+                        .maybe_rejection(e.rejection())
+                        .maybe_backoff(e.backoff())
+                        .error(e.to_string())
+                        .build(),
+                ));
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether reporting this failure would speak for a flow that is not the
+    /// failed request's to speak for.
+    ///
+    /// The event means "no code is coming", so the question is not *how* the
+    /// request failed but whether a code is nonetheless on its way. Answered on
+    /// the state, not on the error variant: the variants that can reach here
+    /// while a flow is live are open-ended — a duplicate request, a withdrawn
+    /// one, its IQ timing out, or a second caller simply passing a bad phone
+    /// number while the first code is still on screen — and enumerating them
+    /// has already been wrong four times.
+    ///
+    /// [`PairCodeError::Cancelled`] is still matched explicitly, because a
+    /// cancellation with no replacement leaves the slot idle: nothing is live,
+    /// yet the caller asked for exactly this and does not need telling.
+    async fn failure_is_not_this_flows_to_report(self: &Arc<Self>, e: &PairError) -> bool {
+        if e.lost_the_flow_to_another_request() {
+            return true;
+        }
+        // A failing request that still owned the slot has released it by now, so
+        // an outstanding flow here belongs to somebody else.
+        self.pair_code_state
+            .lock()
+            .await
+            .is_outstanding(wacore::time::now_secs())
+    }
+
+    async fn pair_with_code_inner(
         self: &Arc<Self>,
         options: PairCodeOptions,
     ) -> Result<String, PairError> {
@@ -325,6 +447,16 @@ impl Client {
         let response = match self.send_iq(query).await {
             Ok(response) => response,
             Err(e) => {
+                // The same ownership recheck the success path does below, and
+                // for the same reason. A 30s IQ timeout easily outlives a
+                // `cancel_pair_code` plus its replacement, and reporting this
+                // request's transport failure would then put an uncorrelated
+                // error on the bus against the flow that now owns the slot.
+                // Losing the slot outranks how this request happened to end.
+                if !self.owns_code_claim(claim).await {
+                    claim_guard.armed = false;
+                    return Err(PairCodeError::Cancelled.into());
+                }
                 claim_guard.release_now().await;
                 return Err(e.into());
             }
@@ -852,6 +984,352 @@ async fn handle_refresh_code(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin the five arms against `WASmaxInMdIqMixinErrors.parseIqMixinErrors`,
+    /// the complete set WA Web's `companion_hello` response parser accepts, so a
+    /// renumber can't silently break a consumer's branching.
+    #[test]
+    fn rejection_codes_match_wa_web() {
+        assert_eq!(PairCodeRejection::BadRequest.code(), 400);
+        assert_eq!(PairCodeRejection::Forbidden.code(), 403);
+        assert_eq!(PairCodeRejection::RateOverlimit.code(), 429);
+        assert_eq!(PairCodeRejection::FeatureNotAvailable.code(), 452);
+        assert_eq!(PairCodeRejection::InternalServerError.code(), 500);
+        // A code outside WA Web's set keeps its number rather than collapsing
+        // into a named arm.
+        assert_eq!(
+            PairCodeRejection::from(418),
+            PairCodeRejection::Unknown(418)
+        );
+    }
+
+    /// `CodeAlreadyOutstanding` is the one failure that must *not* dispatch: a
+    /// code is still live, the consumer already has it from the `PairingCode`
+    /// that minted it, and an error event would say the opposite while inviting
+    /// a retry loop nothing but `cancel_pair_code` or expiry can break.
+    #[tokio::test]
+    async fn an_outstanding_code_is_not_reported_as_a_failure() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        // Park a live code in the slot so the next request is the duplicate.
+        let now = wacore::time::now_secs();
+        *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
+            code_generation_ts: now,
+            claim: wacore::pair_code::PairCodeClaim::next(),
+        };
+
+        let err = client
+            .pair_with_code(PairCodeOptions {
+                phone_number: "15551234567".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a second code must be refused while one is live");
+        assert!(
+            err.lost_the_flow_to_another_request(),
+            "expected CodeAlreadyOutstanding, got: {err:?}"
+        );
+
+        // Let any dispatch that was going to happen get through.
+        tokio::task::yield_now().await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "a still-live code must not be reported as 'no code is coming'"
+        );
+    }
+
+    /// A request cancelled while its `companion_hello` is in flight must not
+    /// report either. It resolves *after* a replacement may already own the
+    /// slot, so the event would be uncorrelated with the flow actually running
+    /// and could make a consumer tear down a live code.
+    #[tokio::test]
+    async fn a_superseded_request_is_not_reported_as_a_failure() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        poll_until("the companion_hello to be on the wire", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+
+        client.cancel_pair_code().await;
+        answer_companion_hello(&client, &transport, 0, b"3@2:late").await;
+
+        let err = pending
+            .await
+            .expect("the pair-code task should not panic")
+            .expect_err("a cancelled request must not report a usable code");
+        assert!(
+            err.lost_the_flow_to_another_request(),
+            "expected Cancelled, got {err:?}"
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "a withdrawn request must not report against the flow that replaced it"
+        );
+    }
+
+    /// The same suppression must hold when the withdrawn request ends in an *IQ
+    /// failure* rather than a late success. A 30 s timeout or a server rejection
+    /// easily outlives a `cancel_pair_code` plus its replacement, and reporting
+    /// this request's transport failure would then land on the flow that now
+    /// owns the slot.
+    #[tokio::test]
+    async fn a_withdrawn_request_reports_cancellation_not_its_iq_failure() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move { client.pair_with_code(options()).await })
+        };
+        poll_until("the companion_hello to be on the wire", || {
+            !transport.sent().is_empty()
+        })
+        .await;
+
+        client.cancel_pair_code().await;
+
+        // Refuse the withdrawn request's IQ, rather than answering it.
+        let hello = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let id = hello
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("companion_hello carries an id")
+            .into_owned();
+        let refusal = NodeBuilder::new("iq")
+            .attrs([
+                ("from", "s.whatsapp.net".to_string()),
+                ("type", "error".to_string()),
+                ("id", id.clone()),
+            ])
+            .children([NodeBuilder::new("error")
+                .attrs([
+                    ("code", "429".to_string()),
+                    ("text", "rate-overlimit".to_string()),
+                ])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &refusal).await;
+
+        let err = pending
+            .await
+            .expect("the pair-code task should not panic")
+            .expect_err("a withdrawn request must not report a usable code");
+        assert!(
+            err.lost_the_flow_to_another_request(),
+            "losing the slot outranks how the request ended, got {err:?}"
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "a withdrawn request's IQ failure must not report against its replacement"
+        );
+    }
+
+    /// Validation runs before the outstanding-flow check, so a second caller
+    /// with a bad number fails as `PhoneNumberTooShort` and never reaches the
+    /// suppressed variants. It must still stay silent while a code is live —
+    /// which is why the suppression asks the state, not the error.
+    #[tokio::test]
+    async fn a_validation_failure_beside_a_live_code_is_not_reported() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
+            code_generation_ts: wacore::time::now_secs(),
+            claim: wacore::pair_code::PairCodeClaim::next(),
+        };
+
+        let err = client
+            .pair_with_code(PairCodeOptions {
+                phone_number: "123".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a 3-digit number must be refused");
+        assert!(
+            matches!(err, PairError::PairCode(PairCodeError::PhoneNumberTooShort)),
+            "validation must still win the race it already wins, got {err:?}"
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_))),
+            "a live code must not be reported as failed by an unrelated bad request"
+        );
+    }
+
+    /// WA Web asserts `code` and `text` as a pair and falls to its generic
+    /// error path when they disagree, so a contradicting text must not keep
+    /// reading as the named arm.
+    #[test]
+    fn a_contradicting_text_yields_no_classification() {
+        let pe: PairError = IqError::ServerError {
+            code: 429,
+            text: "something-else".into(),
+            error_type: None,
+            backoff: None,
+        }
+        .into();
+
+        assert_eq!(
+            pe.rejection(),
+            None,
+            "a pairing WA Web would reject must not drive throttle handling"
+        );
+        // The code is still recoverable from the rendering, so refusing to
+        // classify does not lose it.
+        assert!(pe.to_string().contains("429"), "got: {pe}");
+    }
+
+    /// An absent `text` is not a contradiction. Deliberately laxer than WA Web:
+    /// demoting a bare 429 would clear `is_throttled` and put the issue's silent
+    /// failure back for the one refusal that most needs acting on.
+    #[test]
+    fn an_absent_text_still_classifies_by_code() {
+        let pe: PairError = IqError::ServerError {
+            code: 429,
+            text: String::new(),
+            error_type: None,
+            backoff: None,
+        }
+        .into();
+
+        assert_eq!(pe.rejection(), Some(PairCodeRejection::RateOverlimit));
+        assert!(pe.rejection().is_some_and(PairCodeRejection::is_throttled));
+    }
+
+    /// The whole point of the typed status: a 429 is recoverable as
+    /// `RateOverlimit` without matching the message.
+    #[test]
+    fn rate_overlimit_is_recoverable_as_a_typed_status() {
+        let pe: PairError = IqError::ServerError {
+            code: 429,
+            text: "rate-overlimit".into(),
+            error_type: None,
+            backoff: Some(30),
+        }
+        .into();
+
+        assert_eq!(pe.rejection(), Some(PairCodeRejection::RateOverlimit));
+        assert_eq!(pe.backoff(), Some(std::time::Duration::from_secs(30)));
+        assert!(
+            pe.rejection().is_some_and(PairCodeRejection::is_throttled),
+            "429 must read as throttled"
+        );
+        // `RequestFailed` renders what it wraps, so a log line that prints only
+        // the error still names the refusal.
+        assert!(
+            pe.to_string().contains("429") && pe.to_string().contains("rate-overlimit"),
+            "Display should carry the server's code and text, got: {pe}"
+        );
+    }
+
+    /// `feature-not-available` is the one refusal that retrying cannot fix — it
+    /// must not read as throttled, or a consumer would back off forever instead
+    /// of falling back to the QR code the way WA Web does.
+    #[test]
+    fn feature_not_available_is_not_throttled() {
+        let pe: PairError = IqError::ServerError {
+            code: 452,
+            text: "feature-not-available".into(),
+            error_type: None,
+            backoff: None,
+        }
+        .into();
+
+        assert_eq!(pe.rejection(), Some(PairCodeRejection::FeatureNotAvailable));
+        assert!(!PairCodeRejection::FeatureNotAvailable.is_throttled());
+        assert_eq!(pe.backoff(), None);
+    }
+
+    /// A failure that never reached the server has no status to report, so
+    /// `rejection` stays `None` rather than inventing one.
+    #[test]
+    fn local_failure_reports_no_rejection() {
+        let pe: PairError = PairCodeError::PhoneNumberTooShort.into();
+        assert_eq!(pe.rejection(), None);
+        assert_eq!(pe.backoff(), None);
+    }
+
+    /// The regression the event exists for: a failed request must be observable
+    /// on the bus, not only through the `Err` that
+    /// `BotBuilder::with_pair_code`'s detached task throws away.
+    ///
+    /// Uses a validation failure because it needs no server, and it covers the
+    /// harder half of the guarantee: the dispatch wraps the whole flow, so even
+    /// a path that returns before the IQ is built still reports.
+    #[tokio::test]
+    async fn failed_request_dispatches_pairing_code_error() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+
+        let err = client
+            .pair_with_code(PairCodeOptions {
+                phone_number: "123".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a 3-digit number must be refused");
+        assert!(matches!(
+            err,
+            PairError::PairCode(PairCodeError::PhoneNumberTooShort)
+        ));
+
+        poll_until("a PairingCodeError to reach the bus", || {
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeError(_)))
+        })
+        .await;
+
+        let events = collector.events();
+        let dispatched = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::PairingCodeError(e) => Some(e.clone()),
+                _ => None,
+            })
+            .expect("just polled for it");
+        assert_eq!(
+            dispatched.rejection, None,
+            "a local validation failure never reached the server"
+        );
+        assert_eq!(dispatched.backoff, None);
+        assert!(
+            dispatched.error.contains("too short"),
+            "the message should say what failed, got: {}",
+            dispatched.error
+        );
+    }
 
     #[test]
     fn pair_error_request_failed_preserves_iq_source() {

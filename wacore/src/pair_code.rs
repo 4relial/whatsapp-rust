@@ -620,6 +620,130 @@ impl PairCodeUtils {
     }
 }
 
+/// How the server refused a `companion_hello`, as a matchable status.
+///
+/// The five named variants are the complete set WA Web's own response parser
+/// accepts (`WASmaxInMdIqMixinErrors.parseIqMixinErrors`, reached from
+/// `WASmaxInMdCompanionHelloResponseError`); anything else makes its RPC throw
+/// "unknown error". They exist so a consumer can branch on the refusal instead
+/// of matching the formatted message, which is not a stable surface.
+///
+/// The numbers are the `code` attribute, and each is the enum's whole wire form
+/// — [`code()`](Self::code) is what `Serialize` emits and what `From<i32>` reads
+/// back. WA Web pairs each code with a literal `text`
+/// (`429`/`rate-overlimit`, `452`/`feature-not-available`, …) and rejects a
+/// response whose two disagree, so construct these through
+/// [`from_server`](Self::from_server) rather than from a code alone: it is the
+/// only constructor that sees both attributes, and the only one that can decline
+/// to classify.
+///
+/// WA Web branches on exactly two of them (`DevicePhoneNumberCodeScreen`, on
+/// `CompanionHelloError.type.name`): [`RateOverlimit`](Self::RateOverlimit)
+/// becomes "too many attempts, try again later" and
+/// [`FeatureNotAvailable`](Self::FeatureNotAvailable) becomes "not available to
+/// you yet, link with QR code instead". The rest share a generic "try again or
+/// link with the QR code". In every case it resets the linking flow and waits
+/// for the person to act — it never retries on its own, and never reads the
+/// `backoff` hint, so treat that value as the server's advice rather than a
+/// schedule WA Web is known to follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+#[wire(kind = "int")]
+pub enum PairCodeRejection {
+    /// The request was malformed — **or** throttled for this phone number: the
+    /// server reuses `bad-request` for its per-number pair-code limit rather
+    /// than answering `rate-overlimit`. So this is not reliably a permanent
+    /// failure; see [`PairCodeRejection::is_throttled`].
+    #[wire = 400]
+    BadRequest,
+    #[wire = 403]
+    Forbidden,
+    /// The connection is asking for codes too fast. The server states the rate
+    /// is too high; the only correct response is to slow down.
+    #[wire = 429]
+    RateOverlimit,
+    /// Phone-number linking is not enabled for this account. Retrying will not
+    /// change that — WA Web sends the user to the QR code instead.
+    #[wire = 452]
+    FeatureNotAvailable,
+    #[wire = 500]
+    InternalServerError,
+    /// A `code` outside the set WA Web accepts. Its own RPC would raise
+    /// "unknown error" here; we keep the number so a consumer can log it and a
+    /// server-side addition is visible rather than silently reshaped.
+    #[wire_fallback]
+    Unknown(i32),
+}
+
+impl PairCodeRejection {
+    /// Whether this refusal is the server rate-limiting the request.
+    ///
+    /// True for [`RateOverlimit`](Self::RateOverlimit) and
+    /// [`BadRequest`](Self::BadRequest), because the server throttles pair-code
+    /// requests per phone number under `bad-request` instead of
+    /// `rate-overlimit`. That makes the predicate deliberately wider than the
+    /// literal 429: a `bad-request` may equally be genuinely invalid content,
+    /// and the two are indistinguishable on the wire. Treat a true here as
+    /// "back off, then retry at most a bounded number of times" — not as proof
+    /// the request would ever succeed.
+    pub fn is_throttled(self) -> bool {
+        matches!(self, Self::RateOverlimit | Self::BadRequest)
+    }
+
+    /// The `text` WA Web pairs with this code; `None` for
+    /// [`Unknown`](Self::Unknown), which has no expected pairing.
+    pub fn text(self) -> Option<&'static str> {
+        Some(match self {
+            Self::BadRequest => "bad-request",
+            Self::Forbidden => "forbidden",
+            Self::RateOverlimit => "rate-overlimit",
+            Self::FeatureNotAvailable => "feature-not-available",
+            Self::InternalServerError => "internal-server-error",
+            Self::Unknown(_) => return None,
+        })
+    }
+
+    /// Classify a server `<error>` from both of its attributes, or `None` when
+    /// the two disagree and no classification is honest.
+    ///
+    /// WA Web asserts the pair (`literal(attrInt, …, "code", 429)` beside
+    /// `literal(attrString, …, "text", "rate-overlimit")`) and drops to its
+    /// generic error path when they disagree, so a changed pairing must not keep
+    /// reading as the named arm.
+    ///
+    /// `None` rather than `Unknown(code)` for that case, because `Unknown` could
+    /// not carry it: the wire form of this enum **is** `code()`, so
+    /// `Unknown(429)` serializes to `429` and rehydrates as
+    /// [`RateOverlimit`](Self::RateOverlimit) — a consumer that persisted or
+    /// forwarded the value would get the demotion silently undone and apply
+    /// throttling anyway. There is no in-band value that both records the code
+    /// and refuses to alias the arm it came from. The code is not lost: the
+    /// caller still has the error's own rendering, which names it.
+    ///
+    /// An **absent** `text` is not a contradiction, and the code alone decides.
+    /// Deliberately laxer than WA Web, which would reject it: refusing to
+    /// classify a bare `429` would also clear
+    /// [`is_throttled`](Self::is_throttled), turning the one refusal a consumer
+    /// most needs to act on back into a silent one. A missing attribute is not
+    /// evidence that the code means something else.
+    pub fn from_server(code: u16, text: &str) -> Option<Self> {
+        let by_code = Self::from(i32::from(code));
+        match by_code.text() {
+            Some(expected) if !text.is_empty() && text != expected => None,
+            _ => Some(by_code),
+        }
+    }
+}
+
+impl core::fmt::Display for PairCodeRejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Rendered as the stanza it came from, so a log line reads the same way.
+        match self.text() {
+            Some(text) => write!(f, "{text} ({})", self.code()),
+            None => write!(f, "unknown ({})", self.code()),
+        }
+    }
+}
+
 /// Errors raised by wacore-side pair-code validation, key derivation, and
 /// protocol-bundle building. The high-level crate wraps this in
 /// `whatsapp_rust::pair_code::PairError` and adds an IQ-failure variant for the
