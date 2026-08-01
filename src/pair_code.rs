@@ -903,18 +903,35 @@ async fn run_stage_two(
         .await;
 
     match answer {
-        Ok(_) => {
-            info!(
-                target: "Client/PairCode",
-                "companion_finish acknowledged, waiting for pair-success (flow={flow_id}, attempt={attempt})"
-            );
-            // State stays WaitingForPhoneConfirmation so a retry can reuse it;
-            // only pair-success (see `crate::pair`) transitions to Completed.
-            // The timeout that answers for this send was armed by the caller,
-            // on acceptance.
+        Ok(response) => {
+            // Some server cohorts put <pair-success> on the same IQ response as
+            // companion_finish instead of sending it as a later server IQ. The
+            // generic IQ waiter owns that node and returns early, so route the
+            // embedded success here before treating the response as a bare ACK.
+            if companion_finish_response_has_pair_success(response.get()) {
+                info!(
+                    target: "Client/PairCode",
+                    "companion_finish response carries pair-success; completing the flow (flow={flow_id}, attempt={attempt})"
+                );
+                crate::pair::handle_iq(&client, response.get()).await;
+            } else {
+                info!(
+                    target: "Client/PairCode",
+                    "companion_finish acknowledged, waiting for pair-success (flow={flow_id}, attempt={attempt})"
+                );
+            }
+            // A bare ACK leaves the state waiting so a genuine retry can reuse
+            // it; an embedded pair-success transitions it to Completed above.
+            // The timeout was armed by the caller on primary_hello acceptance.
         }
         Err(e) => report_stage_two_failure(&client, &pairing_ref, attempt, e).await,
     }
+}
+
+fn companion_finish_response_has_pair_success(response: &NodeRef<'_>) -> bool {
+    response
+        .get_optional_child_by_tag(&["pair-success"])
+        .is_some()
 }
 
 /// Write the flow off and tell the consumer why, when `companion_finish` itself
@@ -1128,6 +1145,21 @@ async fn handle_refresh_code(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_finish_response_detects_embedded_pair_success() {
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("pair-success").build()])
+            .build();
+        let bare_response = NodeBuilder::new("iq").build();
+
+        assert!(companion_finish_response_has_pair_success(
+            &response.as_node_ref()
+        ));
+        assert!(!companion_finish_response_has_pair_success(
+            &bare_response.as_node_ref()
+        ));
+    }
 
     /// Pin the five arms against `WASmaxInMdIqMixinErrors.parseIqMixinErrors`,
     /// the complete set WA Web's `companion_hello` response parser accepts, so a
