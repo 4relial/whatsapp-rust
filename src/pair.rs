@@ -312,6 +312,23 @@ async fn handle_pair_success<'a>(
     // and verifying against the old value and then completing against the new
     // one would persist a paired device whose ADV signatures cannot validate.
     let mut pair_code_state = client.pair_code_state.lock().await;
+    if let wacore::pair_code::PairCodeState::WaitingForPhoneConfirmation {
+        pairing_ref,
+        primary_hello_attempt_count,
+        ..
+    } = &*pair_code_state
+    {
+        info!(
+            target: "Client/PairCode",
+            "Received pair-success for active phone-code flow (flow={}, attempt={primary_hello_attempt_count})",
+            crate::pair_code::pairing_flow_id(pairing_ref)
+        );
+    } else {
+        info!(
+            target: "Client/PairCode",
+            "Received pair-success while no phone-code flow is active"
+        );
+    }
 
     let device_snapshot = client.persistence_manager.get_device_snapshot();
     let device_state = DeviceState {

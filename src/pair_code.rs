@@ -60,6 +60,7 @@ use crate::client::Client;
 use crate::request::{InfoQuery, InfoQueryType, IqError};
 use crate::types::events::Event;
 use log::{error, info, warn};
+use sha2::{Digest, Sha256};
 
 use std::sync::Arc;
 use wacore::libsignal::protocol::KeyPair;
@@ -69,6 +70,15 @@ use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 
 pub use wacore::companion_reg::{CompanionOs, CompanionWebClientType};
 pub use wacore::pair_code::{PairCodeError, PairCodeOptions, PairCodeRejection};
+
+/// Correlates a pair-code flow in logs without disclosing the server-issued ref.
+pub(crate) fn pairing_flow_id(pairing_ref: &[u8]) -> String {
+    let digest = Sha256::digest(pairing_ref);
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]
+    )
+}
 
 /// Errors raised by the high-level pair-code flow.
 ///
@@ -739,7 +749,8 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
 
     info!(
         target: "Client/PairCode",
-        "Phone confirmed code entry, processing stage 2"
+        "Phone confirmed code entry, processing stage 2 (flow={}, attempt={attempt})",
+        pairing_flow_id(&pairing_ref),
     );
 
     // Released before the task runs: `run_stage_two` re-takes it.
@@ -795,6 +806,7 @@ async fn run_stage_two(
     primary_identity_pub: [u8; 32],
     attempt: u32,
 ) {
+    let flow_id = pairing_flow_id(&pairing_ref);
     let state_guard = client.pair_code_state.lock().await;
     // The flow can be retired while this task waits for the lock — by
     // pair-success, a cancellation, or a replacement code. Matching the ref
@@ -808,6 +820,10 @@ async fn run_stage_two(
             if current.as_slice() == pairing_ref.as_slice()
     );
     if !still_ours {
+        info!(
+            target: "Client/PairCode",
+            "Skipping retired stage 2 task (flow={flow_id}, attempt={attempt})"
+        );
         return;
     }
 
@@ -854,6 +870,11 @@ async fn run_stage_two(
         ))
         .await;
 
+    info!(
+        target: "Client/PairCode",
+        "Stage 2 bundle prepared and ADV secret persisted (flow={flow_id}, attempt={attempt})"
+    );
+
     // Build and send stage 2 IQ
     let req_id = client.generate_request_id();
     let identity_pub: [u8; 32] = device_snapshot
@@ -885,7 +906,7 @@ async fn run_stage_two(
         Ok(_) => {
             info!(
                 target: "Client/PairCode",
-                "Sent companion_finish, waiting for pair-success"
+                "companion_finish acknowledged, waiting for pair-success (flow={flow_id}, attempt={attempt})"
             );
             // State stays WaitingForPhoneConfirmation so a retry can reuse it;
             // only pair-success (see `crate::pair`) transitions to Completed.
@@ -926,12 +947,17 @@ async fn report_stage_two_failure(
     if error.is_timeout() {
         warn!(
             target: "Client/PairCode",
-            "companion_finish went unanswered; leaving the pair-success timer to write the code off"
+            "companion_finish went unanswered; leaving the pair-success timer to write the code off (flow={}, attempt={attempt})",
+            pairing_flow_id(pairing_ref)
         );
         return;
     }
 
-    error!(target: "Client/PairCode", "companion_finish failed: {error}");
+    error!(
+        target: "Client/PairCode",
+        "companion_finish failed (flow={}, attempt={attempt}): {error}",
+        pairing_flow_id(pairing_ref)
+    );
     if !retire_stage_two_flow(client, pairing_ref, attempt).await {
         return;
     }
@@ -965,7 +991,8 @@ fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt
 
         warn!(
             target: "Client/PairCode",
-            "No pair-success within {timeout:?} of companion_finish; the code will not complete"
+            "No pair-success within {timeout:?} of companion_finish; the code will not complete (flow={}, attempt={attempt})",
+            pairing_flow_id(&pairing_ref)
         );
         client.core.event_bus.dispatch(Event::PairingCodeRefresh(
             crate::types::events::PairingCodeRefresh::builder()
