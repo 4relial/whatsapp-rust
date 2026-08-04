@@ -427,6 +427,22 @@ impl Client {
                     .await;
             }
             MajorSyncTask::AppStateSync { name, full_sync } => {
+                // Reserve the collection like every other sync path does.
+                // Unreserved, this writes the same version and mutation-MAC
+                // rows as a concurrent `sync_collections_batched`, leaving the
+                // ltHash disagreeing with the MAC store.
+                //
+                // Waits rather than skipping, like the patch send and unlike
+                // the batched path. `try_begin`'s "an in-flight one already
+                // does the work" holds only when the holder is an equivalent
+                // sync, and neither condition is guaranteed here: the holder
+                // may be a patch send, which does not fetch at all, and a full
+                // sync asks for the snapshot while an incremental one asks for
+                // patches after the persisted version. Skipping on either
+                // mismatch turns the caller's request into a silent no-op.
+                // Cancelling the wait strands nothing — the reservation only
+                // exists once the guard is returned.
+                let _guard = self.app_state_syncing.begin(name).await;
                 if let Err(e) = self.process_app_state_sync_task(name, full_sync).await {
                     log::warn!("App state sync task for {name:?} failed: {e}");
                 }
@@ -502,8 +518,7 @@ impl Client {
     }
 
     /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
-    /// Matches WA Web's `serverSync()` outer loop (`3JJWKHeu5-P.js:54278-54305`).
-    /// Max 5 iterations (WA Web's `C=5` constant).
+    /// Mirrors WA Web's `serverSync()` outer loop (`WAWebSyncdServerSync`).
     ///
     /// `key_wait_deadline` bounds how long a missing app-state decode key may be
     /// awaited. The initial critical bootstrap passes the shared 180s critical-sync
@@ -550,6 +565,14 @@ impl Client {
         key_wait_deadline: Option<wacore::time::Instant>,
     ) -> Result<()> {
         use wacore::appstate::patch_decode::CollectionSyncError;
+        // Not WA Web's number, despite the shape being the same: its outer loop
+        // bounds at `C = 500`, and the `y = 5` sitting beside it never bites
+        // because the `||` between them keeps 500 the only real limit.
+        // Exhausting it there marks the collections retryable and hands them to
+        // a backoff state machine rather than giving up. We have neither that
+        // state nor the spacing, so raising this on its own would only buy up to
+        // 500 back-to-back IQ rounds; the cap and the backoff belong in one
+        // change.
         const MAX_ITERATIONS: usize = 5;
         let mut iteration = 0;
 
@@ -1964,6 +1987,95 @@ mod send_patch_response_tests {
 #[cfg(test)]
 mod sync_in_flight_tests {
     use super::*;
+
+    /// A consumer-issued full sync must not run alongside a sync already
+    /// writing the collection's version and mutation MACs — and must not be
+    /// dropped either, since the snapshot it asks for is not what an
+    /// incremental sync in flight is fetching.
+    #[tokio::test]
+    async fn a_full_sync_task_waits_for_the_collection() {
+        let client = crate::test_utils::create_test_client_with_name("appstate-task-wait").await;
+        let held = client
+            .app_state_syncing
+            .try_begin(WAPatchName::CriticalBlock)
+            .expect("reserve the collection first");
+
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .process_sync_task(MajorSyncTask::AppStateSync {
+                        name: WAPatchName::CriticalBlock,
+                        full_sync: true,
+                    })
+                    .await;
+            }
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the task ran while the collection was reserved"
+        );
+        assert_eq!(
+            client.app_state_syncing.len(),
+            1,
+            "only the held reservation"
+        );
+
+        drop(held);
+        // The client has no socket, so the sync itself fails fast with
+        // NotConnected; what matters is that it got to run and released.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("released collection must let the task proceed")
+            .expect("task panicked");
+        assert_eq!(
+            client.app_state_syncing.len(),
+            0,
+            "the task's own reservation must be released"
+        );
+    }
+
+    /// An incremental task waits too: the holder may be a patch send, which
+    /// never fetches, so skipping would drop the requested sync entirely.
+    #[tokio::test]
+    async fn an_incremental_sync_task_also_waits() {
+        let client = crate::test_utils::create_test_client_with_name("appstate-task-skip").await;
+        let held = client
+            .app_state_syncing
+            .try_begin(WAPatchName::Regular)
+            .expect("reserve the collection first");
+
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .process_sync_task(MajorSyncTask::AppStateSync {
+                        name: WAPatchName::Regular,
+                        full_sync: false,
+                    })
+                    .await;
+            }
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the task ran while the collection was reserved"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("released collection must let the task proceed")
+            .expect("task panicked");
+        assert_eq!(client.app_state_syncing.len(), 0, "reservation released");
+    }
 
     #[test]
     fn second_begin_blocked_until_release() {
