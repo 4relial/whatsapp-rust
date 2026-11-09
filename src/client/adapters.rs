@@ -312,16 +312,22 @@ impl Client {
         id: Option<&str>,
     ) {
         if let Err(e) = self.flush_signal_cache_batch_safe().await {
-            log_signal_flush_error(context, id, &e);
+            let ident = self.identity_label();
+            log_signal_flush_error(context, id, &ident, &e);
         }
     }
 }
 
-fn log_signal_flush_error(context: &str, id: Option<&str>, e: &SignalMaintenanceError) {
+fn log_signal_flush_error(
+    context: &str,
+    id: Option<&str>,
+    ident: &str,
+    e: &SignalMaintenanceError,
+) {
     if let Some(id) = id {
-        log::error!("Failed to flush signal cache ({context} {id}): {e:?}");
+        log::error!("Failed to flush signal cache ({context} {id}) [{ident}]: {e:?}");
     } else {
-        log::error!("Failed to flush signal cache ({context}): {e:?}");
+        log::error!("Failed to flush signal cache ({context}) [{ident}]: {e:?}");
     }
 }
 

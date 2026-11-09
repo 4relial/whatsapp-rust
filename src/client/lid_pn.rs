@@ -1009,7 +1009,10 @@ impl Client {
                 .await)
             && let Err(error) = self.signal_cache.flush(backend.as_ref()).await
         {
-            warn!("Failed to flush signal cache after migration: {error:?}");
+            warn!(
+                "Failed to flush signal cache after migration [{}]: {error:?}",
+                self.identity_label()
+            );
         }
         migrated_sessions
     }

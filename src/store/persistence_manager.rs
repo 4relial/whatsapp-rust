@@ -359,6 +359,31 @@ impl PersistenceManager {
         self.backend.clone()
     }
 
+    /// Returns the underlying storage identifier or database path, if reported by the backend.
+    pub fn storage_identifier(&self) -> Option<String> {
+        self.backend.storage_identifier().map(|s| s.to_string())
+    }
+
+    /// Concise identity and storage description for diagnostic and error logs:
+    /// e.g. `pn=628123456789@s.whatsapp.net, db=data/sessions/main/whatsapp.db`
+    pub fn identity_label(&self) -> String {
+        let snapshot = self.get_device_snapshot();
+        let mut parts = Vec::new();
+        if let Some(pn) = &snapshot.pn {
+            parts.push(format!("pn={pn}"));
+        } else if let Some(lid) = &snapshot.lid {
+            parts.push(format!("lid={lid}"));
+        } else if !snapshot.push_name.is_empty() {
+            parts.push(format!("name={}", snapshot.push_name));
+        } else {
+            parts.push("unpaired".to_string());
+        }
+        if let Some(path) = self.storage_identifier() {
+            parts.push(format!("db={path}"));
+        }
+        parts.join(", ")
+    }
+
     /// Returns true if the background saver halted due to repeated flush failures.
     pub fn is_saver_halted(&self) -> bool {
         self.saver_halted.load(Ordering::Acquire)
@@ -505,7 +530,8 @@ impl PersistenceManager {
             if let Some(this) = weak.upgrade()
                 && let Err(e) = this.save_to_disk().await
             {
-                error!("Background saver: initial flush failed: {e}");
+                let ident = this.identity_label();
+                error!("Background saver [{ident}]: initial flush failed: {e}");
                 consecutive_failures = 1;
             }
 
@@ -532,12 +558,13 @@ impl PersistenceManager {
                 // On the shutdown path the task is terminating either way; a failed
                 // final flush should not permanently flag the store as halted.
                 if should_exit {
+                    let ident = this.identity_label();
                     match &flush_result {
                         Err(e) => {
-                            error!("Background saver: final flush on shutdown failed: {e}");
+                            error!("Background saver [{ident}]: final flush on shutdown failed: {e}");
                         }
                         Ok(()) => {
-                            debug!("Background saver received shutdown; final flush complete.");
+                            debug!("Background saver [{ident}] received shutdown; final flush complete.");
                         }
                     }
                     return;
@@ -545,16 +572,17 @@ impl PersistenceManager {
 
                 if let Err(e) = flush_result {
                     consecutive_failures += 1;
+                    let ident = this.identity_label();
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         this.saver_halted.store(true, Ordering::Release);
                         error!(
-                            "Background saver: {consecutive_failures} consecutive flush failures, \
+                            "Background saver [{ident}]: {consecutive_failures} consecutive flush failures, \
                              halting to prevent silent data loss. Last error: {e}"
                         );
                         return;
                     }
                     error!(
-                        "Background saver flush failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}"
+                        "Background saver [{ident}] flush failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}"
                     );
                 } else {
                     consecutive_failures = 0;

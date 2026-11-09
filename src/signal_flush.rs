@@ -219,8 +219,9 @@ impl Client {
                             // concurrent traffic cannot reset it to the base
                             // delay. The cache keeps its dirty entries.
                             backoff = (backoff * 2).min(SIGNAL_FLUSH_RETRY_CEILING);
+                            let ident = client.identity_label();
                             log::error!(
-                                "Coalesced signal flush failed; retrying in {backoff:?}: {e:?}"
+                                "Coalesced signal flush failed [{ident}]; retrying in {backoff:?}: {e:?}"
                             );
                         }
                     }

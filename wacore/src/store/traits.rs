@@ -1522,6 +1522,12 @@ pub trait DeviceStore: Send + Sync {
     async fn maintenance(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Diagnostic storage identifier or database path (e.g. SQLite database path).
+    /// Defaulted to `None` for backward compatibility with external backends.
+    fn storage_identifier(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Per-outbound-message secret storage for addon-style decryption.

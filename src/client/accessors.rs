@@ -780,6 +780,17 @@ impl Client {
         self.persistence_manager.get_device_snapshot().lid.clone()
     }
 
+    /// Concise identity and storage description for diagnostic and error logs:
+    /// e.g. `pn=628123456789@s.whatsapp.net, db=data/sessions/main/whatsapp.db`
+    pub fn identity_label(&self) -> String {
+        self.persistence_manager.identity_label()
+    }
+
+    /// Storage identifier or database path from the underlying store backend.
+    pub fn storage_identifier(&self) -> Option<String> {
+        self.persistence_manager.storage_identifier()
+    }
+
     /// Snapshot-consistent identity for span/error tagging (redacted PN, raw LID). Named
     /// fields, not a tuple — LID/PN transposition would otherwise be a silent, unchecked bug.
     #[cfg(feature = "tracing")]

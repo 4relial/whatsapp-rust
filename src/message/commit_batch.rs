@@ -1377,8 +1377,9 @@ impl Client {
                     // generation bump plus the post-permit re-check mean no
                     // late decrypt can mix rowless advances into it.
                     Err(e) => {
+                        let ident = self.identity_label();
                         log::error!(
-                            "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
+                            "cleanup_connection_state: signal cache flush failed [{ident}], keeping cache to avoid dropping Signal state: {e:?}"
                         );
                         DrainOutcome::Failed
                     }
@@ -1473,8 +1474,9 @@ impl Client {
         match self.flush_signal_cache().await {
             Ok(()) => true,
             Err(e) => {
+                let ident = self.identity_label();
                 log::error!(
-                    "Failed to flush signal cache (commit_batch): {e:?}; holding buffered receipts for redelivery"
+                    "Failed to flush signal cache (commit_batch) [{ident}]: {e:?}; holding buffered receipts for redelivery"
                 );
                 false
             }

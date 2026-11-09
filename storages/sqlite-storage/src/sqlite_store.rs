@@ -5390,6 +5390,10 @@ impl DeviceStore for SqliteStore {
         .await
         .unwrap_or_default()
     }
+
+    fn storage_identifier(&self) -> Option<&str> {
+        Some(&self.database_path)
+    }
 }
 
 /// Read a single-integer `PRAGMA` off a connection. `pragma` MUST be a bare

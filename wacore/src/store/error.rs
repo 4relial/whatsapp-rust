@@ -81,6 +81,33 @@ impl StoreError {
             }
         }
     }
+
+    /// Recognizes database corruption errors (e.g. SQLite's `database disk image is malformed`
+    /// or `file is not a database`) from opaque backend error sources.
+    pub fn is_database_corrupt(&self) -> bool {
+        let mut layer: &(dyn std::error::Error + 'static) = self;
+        loop {
+            match layer.downcast_ref::<Self>() {
+                Some(Self::Database(source) | Self::Connection(source)) => {
+                    layer = source.as_ref();
+                    continue;
+                }
+                Some(_) => return false,
+                None => {}
+            }
+            let message = layer.to_string().to_lowercase();
+            if message.contains("malformed")
+                || message.contains("corrupt")
+                || message.contains("file is not a database")
+            {
+                return true;
+            }
+            match layer.source() {
+                Some(inner) => layer = inner,
+                None => return false,
+            }
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -135,5 +162,24 @@ mod tests {
                 "expected {msg:?} to be detected"
             );
         }
+    }
+
+    #[test]
+    fn is_database_corrupt_detects_malformed_and_corrupt() {
+        for msg in [
+            "database disk image is malformed",
+            "file is not a database",
+            "SQLITE_CORRUPT: database disk image is malformed",
+            "Corrupt table",
+        ] {
+            let se = StoreError::Database(Box::new(DummyBackendError(msg)));
+            assert!(
+                se.is_database_corrupt(),
+                "expected {msg:?} to be detected as corruption"
+            );
+        }
+
+        let normal = StoreError::Database(Box::new(DummyBackendError("syntax error")));
+        assert!(!normal.is_database_corrupt());
     }
 }
