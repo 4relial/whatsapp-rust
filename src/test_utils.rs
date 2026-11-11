@@ -99,13 +99,14 @@ pub(crate) fn adv_test_account() -> &'static wacore::libsignal::protocol::KeyPai
     })
 }
 
+/// Seed the shared test account key at the canonical ADV anchor, including for hosted device JIDs.
 #[cfg(test)]
 pub(crate) async fn seed_adv_primary(client: &Client, user: &Jid) {
     use wacore::types::jid::JidExt;
     client
         .signal_cache
         .put_identity(
-            &user.with_device(0).to_protocol_address(),
+            &wacore::types::jid::adv_account_jid(user).to_protocol_address(),
             adv_test_account().public_key.public_key_bytes(),
         )
         .await;
@@ -661,7 +662,21 @@ pub(crate) async fn create_iq_test_client() -> (
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
-    create_iq_test_client_with_backend(create_test_backend().await).await
+    let fixture = create_iq_test_client_with_backend(create_test_backend().await).await;
+    // Default fixtures model a settled client. A delayed SQLite warmup can
+    // otherwise publish a topology change after a test captures its generation.
+    // Custom backend/runtime fixtures remain available for startup races/gates.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !fixture.0.lid_pn_cache.startup_finished_for_tests() {
+            tokio::task::yield_now().await;
+        }
+        // Provenance freezes under mutation before publishing loaded rows.
+        // Join that scope as well, rather than mistaking its flag for an ACK.
+        drop(fixture.0.lid_pn_cache.lock_mutation().await);
+    })
+    .await
+    .expect("default fixture mapping warmup must finish");
+    fixture
 }
 
 /// The same connected, Noise-framed fixture with a caller-owned backend for
@@ -684,6 +699,23 @@ pub(crate) async fn create_iq_test_client_with_runtime(
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
+    create_iq_test_client_with_runtime_and_config(
+        backend,
+        runtime,
+        crate::cache_config::CacheConfig::default(),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn create_iq_test_client_with_runtime_and_config(
+    backend: Arc<dyn Backend>,
+    runtime: Arc<dyn wacore::runtime::Runtime>,
+    config: crate::cache_config::CacheConfig,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
     use crate::transport::mock::CapturingMockTransportFactory;
     use wacore::handshake::NoiseCipher;
 
@@ -696,6 +728,7 @@ pub(crate) async fn create_iq_test_client_with_runtime(
     let transport = factory.transport();
     let (client, _sync_rx) = Client::builder()
         .with_runtime_arc(runtime)
+        .with_cache_config(config)
         .with_persistence_manager(pm)
         .with_transport_factory_arc(Arc::new(factory))
         .with_http_client_arc(Arc::new(MockHttpClient))

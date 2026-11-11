@@ -349,7 +349,7 @@ impl Client {
     pub(crate) fn enter_drain_mode_for_tests(&self) {
         self.offline_sync_completed.store(false, Ordering::Release);
         self.offline_sync_finish_started.store(0, Ordering::Release);
-        self.swap_message_semaphore(1);
+        self.swap_to_drain_semaphore();
         self.inbound_commit_batch.reset();
     }
 
@@ -368,7 +368,7 @@ impl Client {
                 .saturating_add(1),
             Ordering::Release,
         );
-        self.swap_message_semaphore(64);
+        self.swap_to_live_semaphore();
         self.inbound_commit_batch.deactivate();
     }
 }
@@ -1145,53 +1145,82 @@ impl Client {
         InboundCommitState::Deferred(ticket)
     }
 
-    /// Size/byte-cap check, run at the end of stanza processing while the
-    /// global processing permit is still held (so the Signal flush inside the
-    /// commit cannot interleave with a half-processed stanza).
-    pub(crate) async fn maybe_flush_inbound_commits(self: &Arc<Self>) {
-        let over = {
-            let state = self.inbound_commit_batch.lock();
-            state.entries.len() >= MAX_BATCH_MESSAGES || state.bytes >= MAX_BATCH_BYTES
-        };
-        if over {
-            self.flush_inbound_commits_while_processing().await;
-        }
+    /// Whether the accumulated drain batch hit a size/byte trigger. Read-only
+    /// split from the flush so a stanza worker can drop its processing permit
+    /// only when the flush is actually needed.
+    pub(crate) fn inbound_commits_over_capacity(&self) -> bool {
+        let state = self.inbound_commit_batch.lock();
+        state.entries.len() >= MAX_BATCH_MESSAGES || state.bytes >= MAX_BATCH_BYTES
     }
 
-    // The receive caller already owns the processing permit. Capacity pressure
-    // must flush queued predecessors without reacquiring that same permit or
-    // advancing the incoming ciphertext before admission succeeds.
-    pub(crate) async fn flush_inbound_commits_while_processing(self: &Arc<Self>) -> bool {
+    /// Commit the accumulated drain batch under a freshly acquired quiescence,
+    /// for callers that hold no processing permit (a stanza worker that just
+    /// released its own, or any out-of-band site).
+    pub(crate) async fn flush_inbound_commits_quiesced(
+        self: &Arc<Self>,
+        expected_generation: Option<u64>,
+    ) -> bool {
+        let _permits = self.acquire_message_quiescence().await;
+        self.commit_inbound_batch_quiesced(expected_generation)
+            .await
+    }
+
+    /// Commit the accumulated drain batch while the caller ALREADY HOLDS the
+    /// drain quiescence — every drain permit, so no stanza is mid-decrypt
+    /// while the commit's Signal flush persists the cache. Stanza workers get
+    /// here via `with_stanza_permit_suspended`: they release their own permit
+    /// first (re-acquiring afterwards); their already-enqueued entry rides
+    /// this batch, so the release does not expose uncommitted advances.
+    ///
+    /// `expected_generation` stands the flush down if a reconnect reset the
+    /// batcher while the caller waited for quiescence: the new connection
+    /// owns the batch then, and taking it here would commit entries ahead of
+    /// their own drain's finisher.
+    pub(crate) async fn commit_inbound_batch_quiesced(
+        self: &Arc<Self>,
+        expected_generation: Option<u64>,
+    ) -> bool {
+        if let Some(generation) = expected_generation
+            && self.connection_generation.load(Ordering::Acquire) != generation
+        {
+            return true;
+        }
         let PendingInboundBatch {
             entries,
             commit_ticket,
         } = self.inbound_commit_batch.take();
-        let durable = self
-            .commit_pending_batch(entries.into(), BatchOrigin::OfflineDrain, commit_ticket)
-            .await;
+        let durable = if entries.is_empty() {
+            // An empty deferred tail may still contain dirty SKDM state. Its
+            // receipts must wait for persistence, just as in the drain finisher.
+            self.drain_signal_flush_reporting().await
+        } else {
+            self.commit_pending_batch(entries.into(), BatchOrigin::OfflineDrain, commit_ticket)
+                .await
+        };
         if durable && self.inbound_commit_batch.live_transition_pending() {
             self.complete_deferred_live_transition();
         }
         durable
     }
 
-    /// Flush after acquiring a global processing permit, so no stanza is
+    /// Flush after acquiring the full drain quiescence, so no stanza is
     /// mid-decrypt when the Signal cache is flushed: a crash could otherwise
     /// persist a ratchet advance for a message no batch has committed, turning
     /// its redelivery into an unrecoverable duplicate. During the drain the
-    /// semaphore holds a single permit, so this fully serializes with stanza
-    /// processing. An empty batch is NOT a no-op: it still flushes the Signal
+    /// quiescence takes every processing permit, so this fully serializes with
+    /// stanza processing. An empty batch is NOT a no-op: it still flushes the Signal
     /// cache under the permit (idempotent when the cache is already clean), so
     /// an out-of-band batch-safe caller that raced the drain finisher still
     /// gets its advance persisted rather than silently skipped.
     ///
     /// With `deactivate`, this is the end-of-drain transition: commit the tail
-    /// batch and switch the batcher to live mode under the same permit hold.
-    /// That is what makes the transition raceless — no stanza is mid-flight
-    /// when the mode flips (a stanza's enqueue and its stanza-end flush always
-    /// agree), and every stanza still queued behind this permit commits as
-    /// Live strictly AFTER the tail batch, preserving arrival order across the
-    /// boundary. Runs before the semaphore widens to the live permit count.
+    /// batch and switch the batcher to live mode under the same quiescence
+    /// hold. That is what makes the transition raceless — no stanza is
+    /// mid-flight when the mode flips (a stanza's enqueue and its stanza-end
+    /// flush always agree), and every stanza still queued behind this
+    /// quiescence commits as Live strictly AFTER the tail batch, preserving
+    /// arrival order across the boundary. Runs before the semaphore widens to
+    /// the live permit count.
     ///
     /// Returns whether the drain state is durable (see
     /// [`commit_inbound_batch`](Self::commit_inbound_batch)); callers gate the
@@ -1202,7 +1231,7 @@ impl Client {
         expected_epoch: Option<u64>,
         expected_generation: Option<u64>,
     ) -> bool {
-        let _permit = self.acquire_message_processing_permit().await;
+        let _permits = self.acquire_message_quiescence().await;
         if let Some(generation) = expected_generation
             && self.connection_generation.load(Ordering::Acquire) != generation
         {
@@ -1267,7 +1296,7 @@ impl Client {
                 self.inbound_commit_batch.defer_live_transition();
                 self.arm_deferred_transition_retry();
                 log::warn!(
-                    "End-of-drain commit failed; staying in drain mode (single permit) until a durable flush completes the live transition"
+                    "End-of-drain commit failed; staying in drain mode until a durable flush completes the live transition"
                 );
             }
         } else if durable && was_draining && self.inbound_commit_batch.live_transition_pending() {
@@ -1278,11 +1307,11 @@ impl Client {
 
     /// Finish a drain→live transition that a failed end-of-drain tail commit
     /// deferred: the finisher already published completion but left the
-    /// batcher in drain mode AND the semaphore at one permit — the flush
+    /// batcher in drain mode AND the semaphore on the drain pool — the flush
     /// invariant (no stanza mid-decrypt while the whole Signal cache is
-    /// persisted) only holds while stanzas are serialized. Called with the
-    /// permit held and a durable commit just done, so the flip is as raceless
-    /// as the normal end-of-drain one.
+    /// persisted) only holds under full drain quiescence. Called with all
+    /// drain permits held and a durable commit just done, so the flip is as
+    /// raceless as the normal end-of-drain one.
     pub(crate) fn complete_deferred_live_transition(&self) {
         // Receipts buffered during the deferred window (SKDM-only stanzas
         // keep buffering while the batcher is active) are safe to send now:
@@ -1290,7 +1319,7 @@ impl Client {
         // Signal state.
         self.flush_offline_receipts();
         self.inbound_commit_batch.deactivate();
-        self.swap_message_semaphore(64);
+        self.swap_to_live_semaphore();
         // Key-share jobs may have observed the earlier failed transition.
         self.offline_sync_notifier.notify(usize::MAX);
         log::info!("Deferred drain-to-live transition completed after a durable flush");
@@ -1347,7 +1376,7 @@ impl Client {
         limit: std::time::Duration,
     ) -> DrainOutcome {
         let settle = async {
-            let _permit = self.acquire_message_processing_permit().await;
+            let _permits = self.acquire_message_quiescence().await;
             let batch = self.inbound_commit_batch.take();
             let durable = if batch.is_empty() {
                 true
@@ -1483,12 +1512,13 @@ impl Client {
         }
     }
 
-    /// Commit any accumulated entries while the caller ALREADY HOLDS the
-    /// processing permit (mid-stanza recovery paths like UntrustedIdentity),
-    /// so a full-cache Signal flush that follows cannot persist ratchet
-    /// advances for entries without a durable buffered row. Returns whether
-    /// that follow-up flush is safe: on a failed commit the entries are back
-    /// in the batcher (unbuffered), and the caller must skip its flush.
+    /// Commit any accumulated entries while the caller ALREADY HOLDS the full
+    /// drain quiescence (mid-stanza recovery paths like UntrustedIdentity,
+    /// via `with_stanza_permit_suspended`), so a full-cache Signal flush that
+    /// follows cannot persist ratchet advances for entries without a durable
+    /// buffered row. Returns whether that follow-up flush is safe: on a
+    /// failed commit the entries are back in the batcher (unbuffered), and
+    /// the caller must skip its flush.
     #[must_use = "a false result means the entries are back in the batcher and the follow-up Signal flush must be skipped"]
     pub(crate) async fn commit_inbound_batch_holding_permit(self: &Arc<Self>) -> bool {
         let batch = self.inbound_commit_batch.take();
@@ -1496,12 +1526,12 @@ impl Client {
             return true;
         }
         // Deliberately NOT completing a pending deferred transition here even
-        // on a durable commit: the caller holds a permit from the old
-        // single-permit semaphore and follows up with a raw whole-cache
-        // flush, which is only safe while that permit excludes every other
-        // stanza — widening to 64 permits first would let new workers be
-        // mid-decrypt under it. The deferred-retry loop completes the
-        // transition moments later, outside any raw-flush window.
+        // on a durable commit: the caller holds the full drain quiescence and
+        // follows up with a raw whole-cache flush, which is only safe while
+        // every other stanza is excluded — widening to the live pool first
+        // would let new workers be mid-decrypt under it. The deferred-retry
+        // loop completes the transition moments later, outside any raw-flush
+        // window.
         self.commit_pending_batch(
             batch.entries.into(),
             BatchOrigin::OfflineDrain,
@@ -2048,15 +2078,33 @@ mod tests {
             .build()
     }
 
+    #[derive(Clone, Copy)]
+    enum HookDeviceLookup {
+        Metadata,
+        Rotation,
+        MappedMetadata,
+        MappedReset,
+        StoredMapping,
+    }
+
     /// A metadata-only lookup for a user outside this batch must not try to
     /// acquire the single processing permit already held by the hook's caller.
-    async fn hook_lookup_during_drain(recovery: bool) {
+    async fn hook_lookup_during_drain(case: HookDeviceLookup) {
         use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
         use std::time::Duration;
         use wacore_binary::builder::NodeBuilder;
+        let recovery = matches!(case, HookDeviceLookup::Rotation);
+        let mapping = matches!(
+            case,
+            HookDeviceLookup::MappedMetadata | HookDeviceLookup::MappedReset
+        );
+        let reset = matches!(case, HookDeviceLookup::MappedReset);
+        let stored_mapping = matches!(case, HookDeviceLookup::StoredMapping);
         struct LookupHook {
             user: Jid,
-            recovery: bool,
+            expect_error: bool,
+            force_refresh: bool,
+            stored_mapping: bool,
         }
         #[async_trait::async_trait]
         impl InboundDurabilityHook for LookupHook {
@@ -2070,11 +2118,26 @@ mod tests {
                         .iter()
                         .all(|message| message.info.source.sender != self.user)
                 );
-                let result = client
-                    .signal()
-                    .get_user_devices(std::slice::from_ref(&self.user))
-                    .await;
-                if self.recovery {
+                if self.stored_mapping {
+                    client
+                        .add_lid_pn_mapping(
+                            "100000000000195",
+                            &self.user.user,
+                            crate::lid_pn_cache::LearningSource::Usync,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                let result: anyhow::Result<Vec<Jid>> = if self.force_refresh {
+                    client.refresh_user_devices(vec![self.user.clone()]).await
+                } else {
+                    client
+                        .signal()
+                        .get_user_devices(std::slice::from_ref(&self.user))
+                        .await
+                        .map_err(Into::into)
+                };
+                if self.expect_error {
                     let error = result.unwrap_err();
                     assert!(
                         error
@@ -2082,7 +2145,7 @@ mod tests {
                             .contains("cannot run inside an inbound durability hook"),
                         "{error:#}"
                     );
-                    return Err(error.into());
+                    return Err(error);
                 }
                 let devices = result?;
                 assert_eq!(devices, vec![self.user.clone()]);
@@ -2095,14 +2158,16 @@ mod tests {
             .inbound_durability_hook
             .set(Arc::new(LookupHook {
                 user: user.clone(),
-                recovery,
+                expect_error: recovery || reset,
+                force_refresh: reset,
+                stored_mapping,
             }))
             .ok()
             .unwrap();
         let old = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
             rand::rngs::StdRng,
         >());
-        if recovery {
+        if recovery || stored_mapping {
             client
                 .signal_cache
                 .put_identity(
@@ -2111,6 +2176,24 @@ mod tests {
                 )
                 .await;
         }
+        if reset {
+            crate::test_utils::seed_adv_primary(&client, &user).await;
+            client
+                .update_device_list(wacore::store::traits::DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [
+                        wacore::store::traits::DeviceInfo::new(0, None),
+                        wacore::store::traits::DeviceInfo::new(3, Some(1)),
+                    ]
+                    .into(),
+                    raw_id: Some(1),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                })
+                .await
+                .unwrap();
+        }
+        let before_anchor = client.cached_adv_account_identity(&user).await.unwrap();
         client.enter_drain_mode_for_tests();
         let commit = {
             let client = client.clone();
@@ -2126,10 +2209,40 @@ mod tests {
                     .await
             })
         };
+        if stored_mapping {
+            let outcome = tokio::time::timeout(Duration::from_secs(5), commit)
+                .await
+                .expect("public mapping must finish while the hook owns the drain permit")
+                .unwrap();
+            assert!(outcome.persisted && outcome.delivered);
+            assert!(
+                client
+                    .lid_pn_cache
+                    .is_persisted(&user.user, "100000000000195")
+                    .await
+            );
+            // Alias migration uses the ordinary per-address session guards;
+            // unlike key recovery it does not acquire the processing permit.
+            assert!(
+                client
+                    .cached_adv_account_identity(&user)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                client
+                    .cached_adv_account_identity(&Jid::lid("100000000000195"))
+                    .await
+                    .unwrap(),
+                before_anchor
+            );
+            return;
+        }
         let iq = decode_sent_iq(&transport, 0).await;
         let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
         let mut devices = vec![NodeBuilder::new("device").attr("id", "0").build()];
-        if recovery {
+        if recovery || reset {
             devices.push(
                 NodeBuilder::new("device")
                     .attr("id", "2")
@@ -2138,9 +2251,10 @@ mod tests {
             );
         }
         let mut children = vec![NodeBuilder::new("device-list").children(devices).build()];
-        if recovery {
+        if recovery || reset {
             let mut details = wa::ADVKeyIndexList::default();
-            details.raw_id = Some(1);
+            details.raw_id = Some(if reset { 2 } else { 1 });
+            details.timestamp = Some(100);
             details.current_index = Some(1);
             details.valid_indexes = vec![1];
             children.push(
@@ -2152,13 +2266,18 @@ mod tests {
                     .build(),
             );
         }
+        let lid = Jid::lid("100000000000195");
+        let mut user_children = vec![NodeBuilder::new("devices").children(children).build()];
+        if mapping {
+            user_children.push(NodeBuilder::new("lid").attr("val", lid.to_string()).build());
+        }
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
             .children([NodeBuilder::new("usync")
                 .children([NodeBuilder::new("list")
                     .children([NodeBuilder::new("user")
                         .attr("jid", user.to_string())
-                        .children([NodeBuilder::new("devices").children(children).build()])
+                        .children(user_children)
                         .build()])
                     .build()])
                 .build()])
@@ -2174,32 +2293,296 @@ mod tests {
             .expect("hook lookup must finish while it owns the drain permit")
             .unwrap();
         assert!(outcome.persisted);
-        assert_eq!(outcome.delivered, !recovery);
-        if recovery {
+        assert_eq!(outcome.delivered, !(recovery || reset));
+        if recovery || reset {
             assert_eq!(
                 client.cached_adv_account_identity(&user).await.unwrap(),
-                Some(*old.public_key.public_key_bytes())
+                before_anchor
             );
             assert_eq!(
                 transport.sent().len(),
-                2,
+                if recovery { 2 } else { 1 },
                 "hook must not start a detached key-recovery worker"
+            );
+            assert!(
+                client
+                    .lid_pn_cache
+                    .get_current_lid(&user.user)
+                    .await
+                    .is_none()
             );
         } else {
             assert!(client.load_device_record(&user.user).await.is_some());
+            if mapping {
+                assert_eq!(
+                    client
+                        .lid_pn_cache
+                        .get_current_lid(&user.user)
+                        .await
+                        .as_deref(),
+                    Some(lid.user.as_str())
+                );
+                assert!(
+                    client
+                        .persistence_manager
+                        .backend()
+                        .get_lid_mapping(&lid.user)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
         }
         client.ensure_signal_maintenance_context().unwrap();
         client.signal_shutdown_sync();
     }
 
     #[tokio::test]
+    async fn adv_review_round2_peer_reset_preflights_before_learning_other_mapping() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use std::time::Duration;
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore::types::jid::JidExt as _;
+        use wacore_binary::builder::NodeBuilder;
+
+        struct TwoUserHook(Vec<Jid>);
+        #[async_trait::async_trait]
+        impl InboundDurabilityHook for TwoUserHook {
+            async fn on_messages(
+                &self,
+                client: Arc<Client>,
+                _: &[InboundMessage],
+            ) -> anyhow::Result<()> {
+                let error = client
+                    .refresh_user_devices(self.0.clone())
+                    .await
+                    .unwrap_err();
+                anyhow::ensure!(
+                    error
+                        .to_string()
+                        .contains("cannot run inside an inbound durability hook"),
+                    "{error:#}"
+                );
+                Err(error)
+            }
+        }
+
+        for in_hook in [true, false] {
+            let (client, transport) = create_iq_test_client().await;
+            let phone = Jid::pn("12025550167");
+            let lid = Jid::lid("100000000000267");
+            let peer = Jid::pn("12025550168");
+            let users = vec![phone.clone(), peer.clone()];
+            if in_hook {
+                client
+                    .inbound_durability_hook
+                    .set(Arc::new(TwoUserHook(users.clone())))
+                    .ok()
+                    .unwrap();
+                client.enter_drain_mode_for_tests();
+            }
+            let operation = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    if in_hook {
+                        let _permit = client.acquire_message_processing_permit().await;
+                        let outcome = client
+                            .commit_pending_batch_result(
+                                vec![PendingDelivery::from(item("ROUND2_PEER_RESET"))].into(),
+                                BatchOrigin::OfflineDrain,
+                                None,
+                                true,
+                            )
+                            .await;
+                        assert!(outcome.persisted);
+                        Ok(outcome.delivered)
+                    } else {
+                        client.refresh_user_devices(users).await.map(|_| true)
+                    }
+                })
+            };
+            let iq = decode_sent_iq(&transport, 0).await;
+            crate::test_utils::seed_adv_primary(&client, &peer).await;
+            client
+                .update_device_list(DeviceListRecord {
+                    user: peer.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                    raw_id: Some(1),
+                    timestamp: 1,
+                    phash: None,
+                })
+                .await
+                .unwrap();
+            let old_device = peer.with_device(3);
+            let old_address = old_device.to_protocol_address();
+            let old_device_key = old_device.to_string();
+            let old_session = crate::test_utils::synthetic_serialized_session(73, None);
+            let backend = client.persistence_manager.backend();
+            backend
+                .put_session(old_address.as_str(), &old_session)
+                .await
+                .unwrap();
+            assert!(
+                client
+                    .signal_cache
+                    .peek_session(&old_address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let group = "12025550108-1@g.us";
+            backend
+                .set_sender_key_status(group, &[(&old_device_key, true)])
+                .await
+                .unwrap();
+            let mut details = wa::ADVKeyIndexList::default();
+            details.raw_id = Some(2);
+            details.timestamp = Some(100);
+            details.current_index = Some(1);
+            details.valid_indexes = vec![1];
+            let response = NodeBuilder::new("iq")
+                .attr("type", "result")
+                .children([NodeBuilder::new("usync")
+                    .children([NodeBuilder::new("list")
+                        .children([
+                            NodeBuilder::new("user")
+                                .attr("jid", phone.to_string())
+                                .children([
+                                    NodeBuilder::new("lid").attr("val", lid.to_string()).build(),
+                                    NodeBuilder::new("devices")
+                                        .children([NodeBuilder::new("device-list")
+                                            .children([NodeBuilder::new("device")
+                                                .attr("id", "0")
+                                                .build()])
+                                            .build()])
+                                        .build(),
+                                ])
+                                .build(),
+                            NodeBuilder::new("user")
+                                .attr("jid", peer.to_string())
+                                .children([NodeBuilder::new("devices")
+                                    .children([
+                                        NodeBuilder::new("device-list")
+                                            .children([
+                                                NodeBuilder::new("device").attr("id", "0").build(),
+                                                NodeBuilder::new("device")
+                                                    .attr("id", "2")
+                                                    .attr("key-index", "1")
+                                                    .build(),
+                                            ])
+                                            .build(),
+                                        NodeBuilder::new("key-index-list")
+                                            .attr("ts", "100")
+                                            .bytes(crate::test_utils::sign_adv_key_index(
+                                                waproto::codec::adv_key_index_list_to_vec(&details),
+                                            ))
+                                            .build(),
+                                    ])
+                                    .build()])
+                                .build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build();
+            let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            answer_iq(&client, &id, &response).await;
+            // The concurrent registry publication makes the first response
+            // stale. Answer its legitimate retry with the same full batch.
+            let retry = tokio::time::timeout(Duration::from_secs(5), decode_sent_iq(&transport, 1))
+                .await
+                .unwrap();
+            assert!(client.device_list_identity_alias(&phone).await.is_none());
+            let id = retry
+                .get()
+                .attrs()
+                .optional_string("id")
+                .unwrap()
+                .into_owned();
+            answer_iq(&client, &id, &response).await;
+            let delivered = tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered, !in_hook);
+            let backend = client.persistence_manager.backend();
+            assert_eq!(
+                backend
+                    .get_session(old_address.as_str())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                in_hook.then_some(old_session.as_slice()),
+                "rejected hook admission must preserve the companion session"
+            );
+            assert_eq!(
+                client
+                    .signal_cache
+                    .peek_session(&old_address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                in_hook
+            );
+            assert_eq!(
+                backend.get_sender_key_devices(group).await.unwrap(),
+                if in_hook {
+                    vec![(old_device_key, true)]
+                } else {
+                    Vec::new()
+                },
+                "rejected hook admission must preserve sender-key distribution tracking"
+            );
+            assert_eq!(
+                client.device_list_identity_alias(&phone).await.is_some(),
+                !in_hook,
+                "a hook rejected for the independent peer must not publish the other mapping"
+            );
+            assert_eq!(
+                backend.get_lid_mapping(&lid.user).await.unwrap().is_some(),
+                !in_hook
+            );
+            assert_eq!(
+                backend.get_pn_mapping(&phone.user).await.unwrap().is_some(),
+                !in_hook
+            );
+            let record = client.load_device_record_for_jid(&peer).await.unwrap();
+            assert_eq!(record.raw_id, Some(if in_hook { 1 } else { 2 }));
+            assert_eq!(
+                record
+                    .devices
+                    .iter()
+                    .map(|d| d.device_id())
+                    .collect::<Vec<_>>(),
+                if in_hook { vec![0, 3] } else { vec![0, 2] }
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
     async fn offline_durability_hook_can_resolve_an_uncached_ordinary_user() {
-        hook_lookup_during_drain(false).await;
+        hook_lookup_during_drain(HookDeviceLookup::Metadata).await;
     }
 
     #[tokio::test]
     async fn offline_durability_hook_recovery_fails_without_stalling_or_changing_trust() {
-        hook_lookup_during_drain(true).await;
+        hook_lookup_during_drain(HookDeviceLookup::Rotation).await;
+    }
+
+    #[tokio::test]
+    async fn public_mapping_finishes_inside_the_durability_hook() {
+        hook_lookup_during_drain(HookDeviceLookup::StoredMapping).await;
+    }
+
+    #[tokio::test]
+    async fn offline_durability_hook_can_resolve_a_new_mapping_without_reentering_the_permit() {
+        hook_lookup_during_drain(HookDeviceLookup::MappedMetadata).await;
+    }
+
+    #[tokio::test]
+    async fn mapped_reset_cannot_escape_hook_admission_through_an_owned_worker() {
+        hook_lookup_during_drain(HookDeviceLookup::MappedReset).await;
     }
 
     /// Failed drain admission must propagate through the real dispatcher, so
@@ -3420,7 +3803,9 @@ mod tests {
                 .commit_or_batch_inbound(item(&format!("S{i}")), false)
                 .await;
         }
-        client.maybe_flush_inbound_commits().await;
+        if client.inbound_commit_batch.is_active() && client.inbound_commits_over_capacity() {
+            client.flush_inbound_commits_quiesced(None).await;
+        }
 
         let batches = hook.batches.lock().expect("hook lock").clone();
         assert_eq!(batches.len(), 1, "one commit for the full batch");
@@ -3798,6 +4183,41 @@ mod tests {
                 .await,
             "with the flush succeeding the empty commit reports durable"
         );
+    }
+
+    /// A failed SKDM-only tail must keep receipts and drain mode through maintenance retries.
+    #[tokio::test]
+    async fn empty_deferred_maintenance_waits_for_signal_durability() {
+        let client = create_test_client_with_failing_http("empty_deferred_maintenance").await;
+        client.enter_drain_mode_for_tests();
+        assert!(client.try_buffer_offline_receipt(&item("SKDM").info));
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(!client.finish_inbound_commit_drain(generation).await);
+        assert!(client.inbound_commit_batch.live_transition_pending());
+        assert!(
+            !client
+                .flush_inbound_commits_quiesced(Some(generation))
+                .await
+        );
+        assert!(client.inbound_commit_batch.live_transition_pending());
+        assert!(client.inbound_commit_batch.is_active());
+        assert_eq!(client.offline_receipt_buffer.lock().unwrap().len(), 1);
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        assert!(
+            client
+                .flush_inbound_commits_quiesced(Some(generation))
+                .await
+        );
+        assert!(!client.inbound_commit_batch.live_transition_pending());
+        assert!(!client.inbound_commit_batch.is_active());
+        assert!(client.offline_receipt_buffer.lock().unwrap().is_empty());
     }
 
     // WA Web createSnapshot flushes aggregate offline receipts per snapshot;

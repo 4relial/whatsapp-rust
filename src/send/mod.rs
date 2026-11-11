@@ -32,6 +32,7 @@ mod requests;
 pub use requests::{EditRequest, SendRequest};
 pub(crate) mod group_repair;
 mod tctoken_lifecycle;
+mod tctoken_storage;
 pub(crate) use tctoken_lifecycle::is_own_identity;
 
 /// Error returned by the message send path ([`Client::send_message`],
@@ -370,7 +371,7 @@ fn sort_session_lock_keys(keys: &mut Vec<Jid>) {
     let primaries: Vec<_> = keys
         .iter()
         .filter(|jid| jid.device != 0)
-        .map(|jid| jid.with_device(0))
+        .map(wacore::types::jid::adv_account_jid)
         .collect();
     keys.extend(primaries);
     keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
@@ -2122,10 +2123,10 @@ impl Client {
                     wacore::send::retain_skdm_distribution_targets(&mut devices, own_sending_jid);
                 } else if let Some(cached_map) = cached_map {
                     devices.retain(|device| {
-                        !device.is_hosted()
-                            && !(device.user == own_sending_jid.user
+                        !(device.is_hosted()
+                            || (device.user == own_sending_jid.user
                                 && device.device == own_sending_jid.device)
-                            && !cached_map.device_and_primary_warm(&device.user, device.device)
+                            || cached_map.device_and_primary_warm(&device.user, device.device))
                     });
                 }
                 log::debug!(

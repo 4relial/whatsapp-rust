@@ -1363,6 +1363,11 @@ impl<K, V, S> PortableCache<K, V, S> {
     }
 
     #[cfg(test)]
+    pub(crate) async fn hold_write_for_test(&self) -> impl Drop + '_ {
+        self.inner.write().await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn hold_reclaim_after_init_for_test(&self, key: &K) -> impl Drop + '_
     where
         K: Hash,
@@ -1692,7 +1697,12 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mut guard = self.inner.write().await;
+        // Match insert: avoid an allocated listener when uncontended, but
+        // await the same exclusive lock before removing a contended entry.
+        let mut guard = match self.inner.try_write() {
+            Some(guard) => guard,
+            None => self.inner.write().await,
+        };
         match &mut *guard {
             Storage::Plain(inner) => {
                 inner.remove_key(key);
@@ -2040,6 +2050,90 @@ impl<K, V, S> Clone for PortableCache<K, V, S> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn invalidation_waits_for_readers_and_cancellation_keeps_the_entry() {
+        for capacity in [u64::MAX, 2] {
+            let cache = PortableCache::builder().max_capacity(capacity).build();
+            cache.insert(1, 10).await;
+            let reader = cache.inner.read().await;
+            {
+                let mut cancelled = std::pin::pin!(cache.invalidate(&1));
+                assert!(futures::poll!(&mut cancelled).is_pending());
+            }
+            drop(reader);
+            assert_eq!(cache.get(&1).await, Some(10));
+
+            let reader = cache.inner.read().await;
+            let mut waiting = std::pin::pin!(cache.invalidate(&1));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            drop(reader);
+            waiting.await;
+            assert_eq!(cache.get(&1).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidation_cannot_bypass_a_writer_waiting_for_readers() {
+        for capacity in [u64::MAX, 2] {
+            for queued_before_release in [false, true] {
+                let cache = PortableCache::builder().max_capacity(capacity).build();
+                cache.insert(1, 0).await;
+                let reader = cache.inner.read().await;
+                let mut writer = std::pin::pin!(cache.insert(1, 10));
+                assert!(futures::poll!(&mut writer).is_pending());
+                let mut invalidation = std::pin::pin!(cache.invalidate(&1));
+                if queued_before_release {
+                    assert!(futures::poll!(&mut invalidation).is_pending());
+                }
+                drop(reader);
+                // Also exercise a fresh invalidator whose first poll lands
+                // after release, before the older writer is driven again.
+                assert!(futures::poll!(&mut invalidation).is_pending());
+                writer.await;
+                invalidation.await;
+                assert_eq!(cache.get(&1).await, None);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalidation_on_another_worker_waits_for_the_queued_writer() {
+        for capacity in [u64::MAX, 2] {
+            let cache = Arc::new(PortableCache::builder().max_capacity(capacity).build());
+            cache.insert(1, 10).await;
+            let reader = cache.inner.read().await;
+            let mut writer = std::pin::pin!(cache.insert(1, 20));
+            assert!(futures::poll!(&mut writer).is_pending());
+            let release = Arc::new(tokio::sync::Barrier::new(2));
+            let (entered, arrived) = tokio::sync::oneshot::channel();
+            let invalidator = {
+                let cache = Arc::clone(&cache);
+                let release = Arc::clone(&release);
+                tokio::spawn(async move {
+                    release.wait().await;
+                    let mut waiting = std::pin::pin!(cache.invalidate(&1));
+                    assert!(futures::poll!(&mut waiting).is_pending());
+                    entered.send(()).unwrap();
+                    waiting.await;
+                })
+            };
+            // The other worker's first invalidation attempt races this reader
+            // release, while the earlier writer still owns queue admission.
+            release.wait().await;
+            drop(reader);
+            tokio::time::timeout(Duration::from_secs(5), arrived)
+                .await
+                .unwrap()
+                .unwrap();
+            writer.await;
+            tokio::time::timeout(Duration::from_secs(5), invalidator)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cache.get(&1).await, None);
+        }
+    }
 
     #[tokio::test]
     async fn insert_waits_for_readers_and_cancelled_wait_does_not_publish() {

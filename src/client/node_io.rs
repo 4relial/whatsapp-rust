@@ -6,6 +6,21 @@ use crate::client::{PhashWaiter, ResponseWaiter, StreamedResponse};
 use wacore::net::DisconnectReason;
 use wacore::stanza::wire_tags::StanzaTag;
 
+/// Stanza-processing permits granted once the client is live (after the
+/// offline drain completes). Live traffic is latency-bound rather than
+/// backlog-bound, so this is generous.
+pub(crate) const MESSAGE_LIVE_PERMITS: usize = 64;
+
+/// What `with_stanza_permit_suspended` reports back to the suspended stanza.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermitSuspension {
+    /// Same connection: the stanza may keep processing its remaining payloads.
+    Resumed,
+    /// The connection was replaced while suspended: remaining payloads must be
+    /// abandoned unacked so the server redelivers them on the new connection.
+    Reconnected,
+}
+
 /// Non-error exits of [`Client::read_messages_loop`] — `ServerRecycle` keeps the
 /// routine reconnect path out of `Err`, so severity consumers (logs, error
 /// trackers) only fire for genuine failures.
@@ -149,8 +164,8 @@ impl Client {
         bytes
     }
 
-    /// Read the current semaphore generation and Arc atomically under the mutex.
-    pub(crate) fn read_message_semaphore(&self) -> (u64, Arc<async_lock::Semaphore>) {
+    /// Read the current semaphore generation and pool atomically under the mutex.
+    pub(crate) fn read_message_semaphore(&self) -> (u64, MessagePermitSemaphore) {
         let guard = match self.message_processing_semaphore.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -164,16 +179,67 @@ impl Client {
     /// Replace the message processing semaphore and bump the generation counter.
     ///
     /// Both operations happen under the same mutex hold so readers always see
-    /// a consistent (generation, Arc) pair. Must be called from a non-async
+    /// a consistent (generation, pool) pair. Must be called from a non-async
     /// context or inside a scoped block (MutexGuard is !Send).
-    pub(crate) fn swap_message_semaphore(&self, permits: usize) {
+    fn install_message_semaphore(&self, pool: MessagePermitSemaphore) {
         let mut guard = match self.message_processing_semaphore.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        *guard = Arc::new(async_lock::Semaphore::new(permits));
+        *guard = pool;
         self.message_semaphore_generation
             .fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Install the offline-drain semaphore: `offline_drain_permits` concurrent
+    /// stanzas, and a quiescence that takes all of them.
+    pub(crate) fn swap_to_drain_semaphore(&self) {
+        self.install_message_semaphore(MessagePermitSemaphore::drain(self.offline_drain_permits));
+    }
+
+    /// Install the live semaphore: `MESSAGE_LIVE_PERMITS` stanzas, single-permit
+    /// quiescence.
+    pub(crate) fn swap_to_live_semaphore(&self) {
+        self.install_message_semaphore(MessagePermitSemaphore::live(MESSAGE_LIVE_PERMITS));
+    }
+
+    /// Test-only generic swap: `permits` stanzas with single-permit quiescence.
+    /// `1` therefore still yields a fully serialized drain, matching the old
+    /// fixture semantics.
+    #[cfg(test)]
+    pub(crate) fn swap_message_semaphore(&self, permits: usize) {
+        self.install_message_semaphore(MessagePermitSemaphore::live(permits));
+    }
+
+    /// One permit acquire on `semaphore`, warning after 10s of waiting — a
+    /// stalled holder freezes every lane and sender with no other signal, so
+    /// surface long waits instead of hanging silently. The slow path keeps ONE
+    /// acquire future alive across warn ticks so the waiter never loses its
+    /// queue position.
+    async fn acquire_arc_with_warn(
+        &self,
+        semaphore: &Arc<async_lock::Semaphore>,
+    ) -> async_lock::SemaphoreGuardArc {
+        const PERMIT_WAIT_WARN: Duration = Duration::from_secs(10);
+        match semaphore.try_acquire_arc() {
+            Some(permit) => permit,
+            None => {
+                let acquire = semaphore.acquire_arc();
+                futures::pin_mut!(acquire);
+                let sleep = self.runtime.sleep(PERMIT_WAIT_WARN);
+                futures::pin_mut!(sleep);
+                match futures::future::select(&mut acquire, sleep).await {
+                    futures::future::Either::Left((permit, _)) => permit,
+                    futures::future::Either::Right(((), _)) => {
+                        warn!(
+                            "Message-processing permit not acquired after {PERMIT_WAIT_WARN:?} (drain_active={}); a stanza worker or drain flush may be stalled",
+                            self.inbound_commit_batch.is_active()
+                        );
+                        acquire.await
+                    }
+                }
+            }
+        }
     }
 
     /// Acquire one permit from the CURRENT message-processing semaphore.
@@ -184,32 +250,9 @@ impl Client {
     /// processing and the commit batcher: both must serialize on the same
     /// instance for the drain-flush safety argument to hold.
     pub(crate) async fn acquire_message_processing_permit(&self) -> async_lock::SemaphoreGuardArc {
-        // A holder stalling while the drain semaphore is at 1 permit freezes
-        // every lane and sender with no other signal — surface long waits
-        // instead of hanging silently. The slow path keeps ONE acquire future
-        // alive across warn ticks so the waiter never loses its queue position.
-        const PERMIT_WAIT_WARN: Duration = Duration::from_secs(10);
         loop {
-            let (generation, semaphore) = self.read_message_semaphore();
-            let permit = match semaphore.try_acquire_arc() {
-                Some(permit) => permit,
-                None => {
-                    let acquire = semaphore.acquire_arc();
-                    futures::pin_mut!(acquire);
-                    let sleep = self.runtime.sleep(PERMIT_WAIT_WARN);
-                    futures::pin_mut!(sleep);
-                    match futures::future::select(&mut acquire, sleep).await {
-                        futures::future::Either::Left((permit, _)) => permit,
-                        futures::future::Either::Right(((), _)) => {
-                            warn!(
-                                "Message-processing permit not acquired after {PERMIT_WAIT_WARN:?} (drain_active={}); a stanza worker or drain flush may be stalled",
-                                self.inbound_commit_batch.is_active()
-                            );
-                            acquire.await
-                        }
-                    }
-                }
-            };
+            let (generation, pool) = self.read_message_semaphore();
+            let permit = self.acquire_arc_with_warn(&pool.semaphore).await;
             if generation == self.message_semaphore_generation.load(Ordering::SeqCst) {
                 return permit;
             }
@@ -217,6 +260,67 @@ impl Client {
             // retry with the new semaphore.
             drop(permit);
         }
+    }
+
+    /// Acquire every permit the current pool's quiescence requires — all of
+    /// them on the drain pool (so no stanza is mid-decrypt while a batch flush
+    /// or mode transition persists the whole Signal cache), one on the live
+    /// pool. A pool-local mutex serializes collectors so they cannot retain
+    /// disjoint subsets forever. A generation swap mid-acquire drops the
+    /// partial hold and retries on the new pool.
+    pub(crate) async fn acquire_message_quiescence(&self) -> Vec<async_lock::SemaphoreGuardArc> {
+        loop {
+            let (generation, pool) = self.read_message_semaphore();
+            // Fairness of individual acquires cannot prevent two collectors
+            // from each retaining half the pool. Only one may collect at a time.
+            let _collector = pool.quiesce_lock.lock().await;
+            let mut permits = Vec::with_capacity(pool.quiesce_permits);
+            for _ in 0..pool.quiesce_permits {
+                permits.push(self.acquire_arc_with_warn(&pool.semaphore).await);
+            }
+            if generation == self.message_semaphore_generation.load(Ordering::SeqCst) {
+                return permits;
+            }
+            // Generation changed mid-acquire: drop the stale guards and retry
+            // with the new pool.
+            drop(permits);
+        }
+    }
+
+    /// Run `work` under the full drain quiescence from inside a stanza worker.
+    /// The worker's own permit is released first — holding it while waiting
+    /// for the rest would deadlock against every other stanza doing the same —
+    /// then all permits are taken, `work` runs, and one permit is reacquired
+    /// for the caller. The stanza's already-enqueued batch entries are safe to
+    /// expose this way: they ride the batch being flushed, so the release
+    /// cannot surface an uncommitted ratchet advance.
+    ///
+    /// Returns [`PermitSuspension::Reconnected`] when the connection was
+    /// replaced while suspended: the caller must abandon its remaining
+    /// payloads unacked so the server redelivers them.
+    pub(crate) async fn with_stanza_permit_suspended(
+        &self,
+        slot: &mut Option<async_lock::SemaphoreGuardArc>,
+        lane_generation: u64,
+        work: impl Future<Output = bool>,
+    ) -> (PermitSuspension, bool) {
+        drop(slot.take());
+        let quiescence = self.acquire_message_quiescence().await;
+        if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+            return (PermitSuspension::Reconnected, false);
+        }
+        let result = work.await;
+        drop(quiescence);
+        if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+            return (PermitSuspension::Reconnected, result);
+        }
+        *slot = Some(self.acquire_message_processing_permit().await);
+        let suspension = if self.connection_generation.load(Ordering::Acquire) == lane_generation {
+            PermitSuspension::Resumed
+        } else {
+            PermitSuspension::Reconnected
+        };
+        (suspension, result)
     }
 
     /// Read until the connection ends, reporting how it ended.
@@ -1064,7 +1168,7 @@ impl Client {
         drop(node);
         let tx = self
             .inbound_queues()
-            .ack_queue
+            .ack_queue()
             .get_or_init(|| self.start_transport_ack_worker());
         let mut lease = crate::inbound_queue::reserve(&self.inbound_queues().ack, bytes.capacity());
         for _ in 0..crate::inbound_queue::SATURATION_RETRY_TURNS {
@@ -2820,6 +2924,54 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    /// Compare this diagnostic on the exact base and head with identical flags.
+    /// It constructs futures without polling them or opening a network session.
+    #[tokio::test]
+    #[ignore = "layout diagnostic: run on base and head with --ignored --nocapture"]
+    async fn audit_connected_retention_future_layouts() {
+        use std::mem::{size_of, size_of_val};
+        let client = crate::test_utils::create_test_client().await;
+        let shutdown = client.connection_shutdown_signal();
+        let node = crate::test_utils::node_to_owned_ref(&NodeBuilder::new("iq").build());
+        println!(
+            "QueueBudgets: {} bytes",
+            size_of::<crate::inbound_queue::QueueBudgets>()
+        );
+        println!(
+            "read_messages_loop: {} bytes",
+            size_of_val(&client.read_messages_loop())
+        );
+        println!(
+            "read_messages_loop_inner: {} bytes",
+            size_of_val(&client.read_messages_loop_inner())
+        );
+        println!(
+            "process_node_scoped: {} bytes",
+            size_of_val(&client.process_node_scoped(node.clone(), &shutdown, false))
+        );
+        println!(
+            "dispatch_node_scoped: {} bytes",
+            size_of_val(&client.dispatch_node_scoped(node, &shutdown, Some(StanzaTag::Iq), 0))
+        );
+        let reader_client = client.clone();
+        let reader = async move {
+            let connection = reader_client.connect().await?;
+            connection.read_until_disconnected().await;
+            Ok::<(), ConnectError>(())
+        };
+        println!(
+            "connected fixture reader task: {} bytes",
+            size_of_val(&reader)
+        );
+        drop(reader);
+        let primary = Jid::pn("12025550189");
+        println!(
+            "ensure_adv_account_identity: {} bytes",
+            size_of_val(&client.ensure_adv_account_identity(&primary))
+        );
+        client.signal_shutdown_sync();
+    }
+
     #[cfg(feature = "mobile-core")]
     use crate::test_utils::primary_startup_client;
 
@@ -3324,7 +3476,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue().set(tx).is_ok());
         let receipt = || {
             node_to_owned_ref(
                 &NodeBuilder::new("receipt")
@@ -3415,7 +3567,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue().set(tx).is_ok());
         let old = client.connection_shutdown_signal();
         client.reset_connection_shutdown();
         let receipt = node_to_owned_ref(
@@ -3472,7 +3624,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue().set(tx).is_ok());
         let receipt = || {
             node_to_owned_ref(
                 &NodeBuilder::new("receipt")
